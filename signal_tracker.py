@@ -1,7 +1,8 @@
 """
 Signal Tracker - Dual backend (PostgreSQL / SQLite)
 - Lazy initialization: no DB connection until first real use
-- Broad exception handling: never crashes module import
+- Connection pooling for PostgreSQL (reuses connections)
+- Batch queries for indicator stats (1 query instead of N)
 - Compatible with Python 3.10 - 3.12
 """
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 # ======================================================================
-# Detect backend — with bulletproof exception handling
+# Detect backend
 # ======================================================================
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 USE_POSTGRES = False
@@ -32,12 +33,9 @@ if DATABASE_URL.startswith(('postgres://', 'postgresql://')):
         USE_POSTGRES = True
         logger.info("SignalTracker: PostgreSQL backend selected (Supabase)")
     except BaseException as e:
-        # Catch EVERYTHING — even SystemError, OSError, MemoryError
-        # because broken C extensions can raise non-standard exceptions
         logger.error(
             f"psycopg2 import failed: {type(e).__name__}: {e}. "
-            f"Falling back to SQLite. To use PostgreSQL, ensure "
-            f"Python 3.12 or earlier (psycopg2-binary doesn't support 3.14 yet)."
+            f"Falling back to SQLite."
         )
         _psycopg2 = None
         USE_POSTGRES = False
@@ -55,6 +53,33 @@ def _sqlite_path() -> str:
     if os.path.isdir('/data'):
         return '/data/signals.db'
     return 'signals.db'
+
+
+# ======================================================================
+# PostgreSQL connection pool (lazy)
+# ======================================================================
+_pg_pool = None
+_pg_pool_lock = Lock()
+
+
+def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_pool_lock:
+            if _pg_pool is None:
+                try:
+                    from psycopg2 import pool as pg_pool
+                    _pg_pool = pg_pool.SimpleConnectionPool(
+                        minconn=1,
+                        maxconn=5,
+                        dsn=DATABASE_URL,
+                        connect_timeout=10,
+                    )
+                    logger.info("PostgreSQL connection pool created (min=1, max=5)")
+                except Exception as e:
+                    logger.error(f"Failed to create PostgreSQL pool: {e}")
+                    _pg_pool = None
+    return _pg_pool
 
 
 # ======================================================================
@@ -81,6 +106,12 @@ class _PgConnection:
     def commit(self):
         self._conn.commit()
 
+    def rollback(self):
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
     def close(self):
         self._conn.close()
 
@@ -90,21 +121,65 @@ class _PgConnection:
     def __exit__(self, *args):
         try:
             self._conn.commit()
-        finally:
-            self._conn.close()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
 
 
 @contextmanager
 def _get_conn():
+    """Yield a DB connection. Uses pooling for PostgreSQL, direct for SQLite."""
     if USE_POSTGRES and _psycopg2 is not None:
-        raw = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
-        try:
-            yield _PgConnection(raw)
-        finally:
+        p = _get_pg_pool()
+        if p is not None:
+            conn = None
             try:
-                raw.close()
-            except Exception:
-                pass
+                conn = p.getconn()
+                wrapped = _PgConnection(conn)
+                try:
+                    yield wrapped
+                    try:
+                        conn.commit()
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            except Exception as e:
+                # Pool failure → fallback to direct
+                if conn is None:
+                    logger.warning(f"Pool getconn failed, using direct: {e}")
+                    raw = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
+                    try:
+                        yield _PgConnection(raw)
+                    finally:
+                        try:
+                            raw.close()
+                        except Exception:
+                            pass
+                else:
+                    raise
+            finally:
+                if conn is not None:
+                    try:
+                        p.putconn(conn)
+                    except Exception:
+                        pass
+        else:
+            # No pool → direct connection
+            raw = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            try:
+                yield _PgConnection(raw)
+            finally:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
     else:
         conn = sqlite3.connect(_sqlite_path(), timeout=10.0)
         conn.row_factory = sqlite3.Row
@@ -213,6 +288,7 @@ class SignalTracker:
         self._initialized = False
         self._init_failed = False
 
+    # ------------------------------------------------------------------
     def _ensure_init(self) -> bool:
         if self._initialized:
             return True
@@ -244,6 +320,7 @@ class SignalTracker:
                 except Exception as e:
                     logger.debug(f"Index skipped: {e}")
 
+    # ------------------------------------------------------------------
     def record(self, signal) -> None:
         if not self._ensure_init():
             return
@@ -277,6 +354,7 @@ class SignalTracker:
         except Exception as e:
             logger.error(f"SignalTracker.record error: {e}")
 
+    # ------------------------------------------------------------------
     def evaluate_pending(self, current_prices: Dict[str, float]) -> int:
         if not self._ensure_init():
             return 0
@@ -294,7 +372,10 @@ class SignalTracker:
 
                 for row in rows:
                     r = dict(row) if not isinstance(row, dict) else row
-                    created = datetime.fromisoformat(r['created_at'])
+                    try:
+                        created = datetime.fromisoformat(r['created_at'])
+                    except Exception:
+                        continue
                     age = (now - created).total_seconds()
                     price_now = current_prices.get(r['symbol'])
                     if not price_now or not r['price']:
@@ -350,6 +431,9 @@ class SignalTracker:
             except Exception as e:
                 logger.debug(f"upsert failed {ind}: {e}")
 
+    # ------------------------------------------------------------------
+    # SINGLE indicator stats
+    # ------------------------------------------------------------------
     def get_indicator_stats(self, indicator: str) -> Dict[str, int]:
         empty = {'wins': 0, 'losses': 0, 'total': 0}
         if not self._ensure_init():
@@ -371,6 +455,32 @@ class SignalTracker:
             logger.error(f"get_indicator_stats error: {e}")
         return empty
 
+    # ------------------------------------------------------------------
+    # ⚡ BATCH indicator stats (1 query instead of N)
+    # ------------------------------------------------------------------
+    def get_all_indicator_stats_batch(self) -> Dict[str, Dict[str, int]]:
+        """Return stats for ALL indicators in a single query."""
+        if not self._ensure_init():
+            return {}
+        try:
+            with _get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT indicator, wins, losses, total FROM indicator_accuracy"
+                ).fetchall()
+                out: Dict[str, Dict[str, int]] = {}
+                for row in rows:
+                    r = dict(row) if not isinstance(row, dict) else row
+                    out[r['indicator']] = {
+                        'wins': int(r['wins'] or 0),
+                        'losses': int(r['losses'] or 0),
+                        'total': int(r['total'] or 0),
+                    }
+                return out
+        except Exception as e:
+            logger.error(f"get_all_indicator_stats_batch error: {e}")
+            return {}
+
+    # ------------------------------------------------------------------
     def get_all_stats(self) -> List[Dict]:
         if not self._ensure_init():
             return []
@@ -448,6 +558,7 @@ class SignalTracker:
             'initialized': self._initialized,
             'init_failed': self._init_failed,
             'psycopg2_loaded': _psycopg2 is not None,
+            'pool_created': _pg_pool is not None,
         }
         if not self._initialized and not self._init_failed:
             info['note'] = 'lazy — not yet initialized'
