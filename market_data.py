@@ -1,12 +1,13 @@
 """
 Multi-exchange market data client with automatic failover.
-Tries exchanges in order until one succeeds.
-Includes per-exchange rate limiting, caching, and ban detection.
+Supports API keys for higher rate limits.
+Priority: user-configured, with signed requests when keys available.
 """
+import os
+import re
 import time
 import logging
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
 from threading import Lock
 
 import ccxt
@@ -14,47 +15,52 @@ import ccxt
 logger = logging.getLogger(__name__)
 
 
-# Priority order - cloud-friendly exchanges first
+# Priority: cloud-friendly first, then Binance (which needs keys to be safe)
 DEFAULT_EXCHANGES = ['okx', 'bybit', 'kraken', 'binance']
 
-# Symbol format compatibility
-# Most exchanges use BTC/USDT, but Kraken uses BTC/USDT as well via ccxt.
-# ccxt handles the mapping internally.
-
-# Per-exchange rate limit (milliseconds between requests)
 RATE_LIMITS = {
-    'okx': 200,
-    'bybit': 200,
-    'kraken': 500,
-    'binance': 300,
+    'okx': 150,
+    'bybit': 150,
+    'kraken': 400,
+    'binance': 200,   # stricter to protect quota
 }
 
-# Cache TTL per data type (seconds)
 OHLCV_CACHE_TTL = 30
 TICKER_CACHE_TTL = 10
 
+# Max ban duration we self-impose (seconds)
+MAX_SELF_BAN = 6 * 3600
+
 
 class ExchangeWrapper:
-    """Wrapper around a single ccxt exchange with rate limiting + ban tracking."""
+    """Wrapper with rate limiting, ban tracking, and API key support."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, api_key: str = '', secret: str = ''):
         self.name = name
+        self.api_key = api_key
+        self.secret = secret
         self.exchange = None
         self.last_call = 0.0
         self.banned_until = 0.0
         self.consecutive_errors = 0
         self.lock = Lock()
+        self.authenticated = bool(api_key and secret)
         self._init_exchange()
 
     def _init_exchange(self):
         try:
             ex_class = getattr(ccxt, self.name)
-            self.exchange = ex_class({
+            opts = {
                 'enableRateLimit': True,
                 'timeout': 15000,
                 'options': {'defaultType': 'spot'},
-            })
-            logger.info(f"Exchange initialized: {self.name}")
+            }
+            if self.authenticated:
+                opts['apiKey'] = self.api_key
+                opts['secret'] = self.secret
+            self.exchange = ex_class(opts)
+            auth_label = "authenticated" if self.authenticated else "public"
+            logger.info(f"Exchange initialized: {self.name} ({auth_label})")
         except Exception as e:
             logger.error(f"Failed to init {self.name}: {e}")
             self.exchange = None
@@ -76,11 +82,9 @@ class ExchangeWrapper:
 
     def _handle_error(self, e: Exception, operation: str, symbol: str):
         err_str = str(e)
-        # Detect ban
-        if '418' in err_str or '429' in err_str or 'banned' in err_str.lower():
-            ban_seconds = 3600  # default 1 hour
-            # Try to extract ban timestamp
-            import re
+        # Ban detection
+        if '418' in err_str or 'banned' in err_str.lower():
+            ban_seconds = MAX_SELF_BAN
             m = re.search(r'banned until (\d+)', err_str)
             if m:
                 try:
@@ -88,16 +92,20 @@ class ExchangeWrapper:
                     ban_seconds = max(60, ban_ts - time.time())
                 except Exception:
                     pass
-            # Cap at 6 hours to avoid indefinite bans
-            ban_seconds = min(ban_seconds, 21600)
+            ban_seconds = min(ban_seconds, MAX_SELF_BAN)
             self.banned_until = time.time() + ban_seconds
             logger.error(
                 f"[{self.name}] BANNED for {ban_seconds/60:.1f} min "
-                f"({operation} {symbol}): {err_str[:120]}"
+                f"({operation} {symbol})"
             )
+        elif '429' in err_str or 'rate limit' in err_str.lower():
+            # Soft rate limit - back off but don't ban
+            backoff = 60
+            self.banned_until = time.time() + backoff
+            logger.warning(f"[{self.name}] Rate limited - backoff {backoff}s")
         else:
             self.consecutive_errors += 1
-            logger.warning(f"[{self.name}] {operation} {symbol} error: {err_str[:120]}")
+            logger.warning(f"[{self.name}] {operation} {symbol}: {err_str[:120]}")
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> Optional[List]:
         if not self.is_available():
@@ -125,11 +133,20 @@ class ExchangeWrapper:
 
 
 class MarketDataClient:
-    """Multi-exchange client with failover, caching, and ban awareness."""
+    """Multi-exchange client with failover, caching, and API key support."""
 
-    def __init__(self, exchange_names: Optional[List[str]] = None):
+    def __init__(self, exchange_names: Optional[List[str]] = None,
+                 exchange_keys: Optional[Dict[str, Dict[str, str]]] = None):
         names = exchange_names or DEFAULT_EXCHANGES
-        self.wrappers: List[ExchangeWrapper] = [ExchangeWrapper(n) for n in names]
+        keys = exchange_keys or {}
+        self.wrappers: List[ExchangeWrapper] = []
+        for n in names:
+            cred = keys.get(n, {})
+            self.wrappers.append(ExchangeWrapper(
+                n,
+                api_key=cred.get('api_key', ''),
+                secret=cred.get('secret', ''),
+            ))
         self._ohlcv_cache: Dict[str, Tuple[float, List]] = {}
         self._ticker_cache: Dict[str, Tuple[float, Dict]] = {}
         self._cache_lock = Lock()
@@ -184,6 +201,7 @@ class MarketDataClient:
                 {
                     'name': w.name,
                     'available': w.is_available(),
+                    'authenticated': w.authenticated,
                     'banned_for_seconds': max(0, int(w.banned_until - time.time())),
                     'errors': w.consecutive_errors,
                 }
@@ -195,3 +213,41 @@ class MarketDataClient:
         with self._cache_lock:
             self._ohlcv_cache.clear()
             self._ticker_cache.clear()
+
+
+# ======================================================================
+# Global registry of API keys per exchange
+# ======================================================================
+def get_exchange_keys() -> Dict[str, Dict[str, str]]:
+    """Read API keys from environment for each supported exchange."""
+    keys = {}
+
+    # Binance
+    if os.environ.get('BINANCE_API_KEY') and os.environ.get('BINANCE_SECRET_KEY'):
+        keys['binance'] = {
+            'api_key': os.environ['BINANCE_API_KEY'],
+            'secret': os.environ['BINANCE_SECRET_KEY'],
+        }
+
+    # OKX
+    if os.environ.get('OKX_API_KEY') and os.environ.get('OKX_SECRET_KEY'):
+        keys['okx'] = {
+            'api_key': os.environ['OKX_API_KEY'],
+            'secret': os.environ['OKX_SECRET_KEY'],
+        }
+
+    # Bybit
+    if os.environ.get('BYBIT_API_KEY') and os.environ.get('BYBIT_SECRET_KEY'):
+        keys['bybit'] = {
+            'api_key': os.environ['BYBIT_API_KEY'],
+            'secret': os.environ['BYBIT_SECRET_KEY'],
+        }
+
+    # Kraken
+    if os.environ.get('KRAKEN_API_KEY') and os.environ.get('KRAKEN_SECRET_KEY'):
+        keys['kraken'] = {
+            'api_key': os.environ['KRAKEN_API_KEY'],
+            'secret': os.environ['KRAKEN_SECRET_KEY'],
+        }
+
+    return keys
