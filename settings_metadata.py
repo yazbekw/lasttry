@@ -37,6 +37,17 @@ SETTINGS_METADATA = {
         'help': 'كم ثانية ينتظر البوت بين كل تحديث وآخر. 120 = دقيقتان (موصى به)',
         'default': 120,
     },
+    'EXCHANGE_PRIORITY': {
+        'label': 'ترتيب منصات البيانات',
+        'type': 'text',
+        'group': 'exchange',
+        'help': (
+            'ترتيب المنصات التي يجلب منها البوت البيانات، مفصولة بفواصل.\n'
+            'okx,bybit,kraken,binance — إذا فشلت الأولى ينتقل للتي بعدها تلقائياً.\n'
+            'OKX و Bybit أكثر تسامحاً مع IPs السحابية من Binance.'
+        ),
+        'default': 'okx,bybit,kraken,binance',
+    },
     'MAX_CANDLES': {
         'label': 'عدد الشموع للتحليل',
         'type': 'number',
