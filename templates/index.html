@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto Signal Analyzer v6.0</title>
+<style>
+:root {
+    --bg: #0f1419;
+    --card: #1a2332;
+    --border: #2a3a4d;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --primary: #2E86AB;
+    --success: #3BB273;
+    --warning: #e6a817;
+    --danger: #d64545;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    padding: 20px; max-width: 1400px; margin: 0 auto;
+}
+header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 20px 0; border-bottom: 2px solid var(--border); margin-bottom: 30px;
+    flex-wrap: wrap; gap: 15px;
+}
+h1 { font-size: 1.5rem; }
+.header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.btn {
+    padding: 8px 16px; border: none; border-radius: 6px;
+    font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    text-decoration: none; color: white; display: inline-block;
+    font-family: inherit;
+}
+.btn-primary { background: var(--primary); }
+.btn-secondary { background: #3a4a5d; }
+.btn:hover { opacity: 0.9; }
+.status-bar {
+    display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px;
+}
+.status-item {
+    background: var(--card); border: 1px solid var(--border);
+    padding: 10px 16px; border-radius: 8px; font-size: 0.88rem;
+}
+.status-item .label { color: var(--muted); margin-left: 8px; }
+.status-item .value { font-weight: 600; }
+.stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px; margin-bottom: 25px;
+}
+.stat-card {
+    background: var(--card); border: 1px solid var(--border);
+    padding: 15px; border-radius: 8px; text-align: center;
+}
+.stat-value { font-size: 1.6rem; font-weight: 700; }
+.stat-label { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+.stat-card.buy .stat-value { color: var(--success); }
+.stat-card.sell .stat-value { color: var(--danger); }
+.stat-card.neutral .stat-value { color: var(--muted); }
+.coins-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 15px; margin-bottom: 30px;
+}
+.coin-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; transition: transform 0.2s;
+}
+.coin-card:hover { transform: translateY(-2px); }
+.coin-card.signal-success { border-right: 4px solid var(--success); }
+.coin-card.signal-primary { border-right: 4px solid var(--primary); }
+.coin-card.signal-warning { border-right: 4px solid var(--warning); }
+.coin-card.signal-danger  { border-right: 4px solid var(--danger); }
+.coin-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 15px; background: rgba(0,0,0,0.2); border-bottom: 1px solid var(--border);
+}
+.coin-name { font-weight: 700; font-size: 1.05rem; }
+.coin-symbol { color: var(--muted); font-size: 0.85rem; margin-top: 2px; }
+.signal-badge {
+    padding: 6px 12px; border-radius: 20px; font-weight: 700; font-size: 0.78rem;
+    color: white; white-space: nowrap;
+}
+.badge-success { background: var(--success); }
+.badge-primary { background: var(--primary); }
+.badge-warning { background: var(--warning); color: #000; }
+.badge-danger { background: var(--danger); }
+.badge-secondary { background: var(--muted); }
+.coin-body { padding: 15px; }
+.price-row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 12px;
+}
+.price { font-size: 1.35rem; font-weight: 700; }
+.change { font-size: 0.95rem; font-weight: 600; }
+.change.up { color: var(--success); }
+.change.down { color: var(--danger); }
+.score-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 0; border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border); margin-bottom: 12px;
+    font-size: 0.9rem;
+}
+.score-value { font-weight: 700; font-size: 1.05rem; }
+.indicators { display: flex; flex-direction: column; gap: 6px; }
+.indicator-row {
+    display: flex; align-items: center; gap: 8px; font-size: 0.83rem;
+}
+.indicator-dot {
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+}
+.indicator-name { flex: 1; color: var(--muted); }
+.indicator-value { font-weight: 700; }
+.indicator-value.positive { color: var(--success); }
+.indicator-value.negative { color: var(--danger); }
+.indicator-value.zero { color: var(--muted); }
+.meta-row {
+    display: flex; justify-content: space-between;
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: 0.78rem; color: var(--muted);
+}
+.notifications {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; margin-bottom: 30px;
+}
+.notifications h2 { margin-bottom: 15px; font-size: 1.1rem; }
+.notif-item {
+    padding: 10px; border-right: 3px solid var(--primary);
+    background: rgba(46,134,171,0.05); border-radius: 6px;
+    margin-bottom: 8px; font-size: 0.85rem;
+}
+.notif-item.buy { border-right-color: var(--success); }
+.notif-item.sell { border-right-color: var(--danger); }
+.notif-time { color: var(--muted); font-size: 0.75rem; }
+.empty-msg { color: var(--muted); text-align: center; padding: 20px; }
+.auto-refresh-note {
+    color: var(--muted); font-size: 0.8rem; text-align: center; margin-top: 20px;
+}
+footer {
+    text-align: center; padding: 20px; color: var(--muted); font-size: 0.8rem;
+    border-top: 1px solid var(--border); margin-top: 30px;
+}
+</style>
+</head>
+<body>
+
+<header>
+    <div>
+        <h1>📊 محلل إشارات العملات v6.0</h1>
+        <div style="color:var(--muted);font-size:0.85rem;margin-top:4px;">
+            إشارات مرجّحة — BUY / SELL / NEUTRAL
+        </div>
+    </div>
+    <div class="header-actions">
+        <button class="btn btn-primary" onclick="manualUpdate()">🔄 تحديث الآن</button>
+        <a href="/settings" class="btn btn-secondary">⚙️ الإعدادات</a>
+    </div>
+</header>
+
+<!-- Status bar -->
+<div class="status-bar">
+    <div class="status-item">
+        <span class="label">BTC:</span>
+        <span class="value">
+            {% if stats.btc_bullish %}🟢 صاعد{% else %}🔴 {{ stats.btc_trend }}{% endif %}
+        </span>
+    </div>
+    <div class="status-item">
+        <span class="label">الخوف والطمع:</span>
+        <span class="value">{{ stats.fear_greed_index }}</span>
+    </div>
+    <div class="status-item">
+        <span class="label">آخر تحديث:</span>
+        <span class="value">{{ stats.last_update_str }}</span>
+    </div>
+    <div class="status-item">
+        <span class="label">الفريم:</span>
+        <span class="value">{{ stats.config.timeframe }} / {{ stats.config.htf_timeframe }}</span>
+    </div>
+    <div class="status-item">
+        <span class="label">فلتر BTC:</span>
+        <span class="value">{{ stats.config.btc_filter_mode }}</span>
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="stats-grid">
+    <div class="stat-card buy">
+        <div class="stat-value">{{ stats.strong_buy_signals }}</div>
+        <div class="stat-label">شراء قوي</div>
+    </div>
+    <div class="stat-card buy">
+        <div class="stat-value">{{ stats.buy_signals }}</div>
+        <div class="stat-label">شراء</div>
+    </div>
+    <div class="stat-card neutral">
+        <div class="stat-value">{{ stats.neutral_signals }}</div>
+        <div class="stat-label">محايد</div>
+    </div>
+    <div class="stat-card sell">
+        <div class="stat-value">{{ stats.sell_signals }}</div>
+        <div class="stat-label">بيع</div>
+    </div>
+    <div class="stat-card sell">
+        <div class="stat-value">{{ stats.strong_sell_signals }}</div>
+        <div class="stat-label">بيع قوي</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ "%.1f"|format(stats.avg_signal) }}%</div>
+        <div class="stat-label">متوسط الإشارة</div>
+    </div>
+</div>
+
+<!-- Coins -->
+<div class="coins-grid">
+    {% for coin in coins %}
+    <div class="coin-card signal-{{ coin.signal_color }}">
+        <div class="coin-header">
+            <div>
+                <div class="coin-name">{{ coin.name }}</div>
+                <div class="coin-symbol">{{ coin.symbol }}</div>
+            </div>
+            <div class="signal-badge badge-{{ coin.signal_color }}">
+                {{ coin.signal_type }}
+            </div>
+        </div>
+        <div class="coin-body">
+            {% if coin.is_valid %}
+            <div class="price-row">
+                <div class="price">${{ coin.formatted_price }}</div>
+                <div class="change {% if coin.price_change_24h >= 0 %}up{% else %}down{% endif %}">
+                    {{ coin.formatted_24h_change }}
+                </div>
+            </div>
+
+            <div class="score-row">
+                <span>النتيجة المرجّحة:</span>
+                <span class="score-value">
+                    {{ "%+.2f"|format(coin.total_score) }} / 4.5
+                    ({{ "%+.1f"|format(coin.total_percentage) }}%)
+                </span>
+            </div>
+
+            <div class="indicators">
+                {% for ind in coin.indicators %}
+                <div class="indicator-row">
+                    <span class="indicator-dot" style="background: {{ ind.color }};"></span>
+                    <span class="indicator-name">{{ ind.display_name }}</span>
+                    <span class="indicator-value
+                        {% if ind.raw_score > 0 %}positive
+                        {% elif ind.raw_score < 0 %}negative
+                        {% else %}zero{% endif %}">
+                        {{ "%+.2f"|format(ind.raw_score) }}
+                    </span>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div class="meta-row">
+                <span>HTF: {{ coin.htf_trend }}</span>
+                <span>{{ coin.last_updated_str }}</span>
+            </div>
+            {% else %}
+            <div class="empty-msg">لا توجد بيانات بعد</div>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Notifications -->
+<div class="notifications">
+    <h2>🔔 آخر الإشعارات</h2>
+    {% if notifications %}
+        {% for n in notifications %}
+        <div class="notif-item {% if 'buy' in n.notification_type %}buy{% elif 'sell' in n.notification_type %}sell{% endif %}">
+            <div><strong>{{ n.coin_name }} ({{ n.coin_symbol }})</strong> — {{ n.notification_type | upper }}</div>
+            <div>السعر: ${{ "%.4f"|format(n.price) }} | القوة: {{ "%.1f"|format(n.signal_strength) }}%</div>
+            <div class="notif-time">{{ n.timestamp.strftime('%Y-%m-%d %H:%M') }}</div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="empty-msg">لا توجد إشعارات بعد</div>
+    {% endif %}
+</div>
+
+<div class="auto-refresh-note">
+    يتم تحديث الصفحة تلقائياً كل 60 ثانية
+</div>
+
+<footer>
+    Crypto Signal Analyzer v6.0 — Weighted Edition
+</footer>
+
+<script>
+async function manualUpdate() {
+    try {
+        const resp = await fetch('/api/update', { method: 'POST' });
+        const data = await resp.json();
+        if (data.status === 'success') {
+            setTimeout(() => location.reload(), 500);
+        } else {
+            alert('فشل التحديث');
+        }
+    } catch (e) {
+        alert('خطأ: ' + e.message);
+    }
+}
+
+// Auto-refresh every 60s
+setTimeout(() => location.reload(), 60000);
+</script>
+</body>
+</html>
