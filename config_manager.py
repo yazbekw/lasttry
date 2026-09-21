@@ -47,6 +47,7 @@ class ConfigManager:
         'NOTIFY_ON_BUY': True,
         'NOTIFY_ON_SELL': True,
         'MIN_NOTIFY_INTERVAL': 600,
+        'EXCHANGE_PRIORITY': 'okx,bybit,kraken,binance',
     }
 
     TYPES: Dict[str, type] = {
@@ -69,6 +70,7 @@ class ConfigManager:
         'NOTIFY_ON_BUY': bool,
         'NOTIFY_ON_SELL': bool,
         'MIN_NOTIFY_INTERVAL': int,
+        'EXCHANGE_PRIORITY': str,
     }
 
     _instance = None
