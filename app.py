@@ -20,6 +20,7 @@ import ccxt
 
 from config_manager import config
 from settings_metadata import SETTINGS_METADATA, SETTINGS_GROUPS
+from market_data import MarketDataClient
 
 # ======================================================================
 # Logging setup
@@ -186,33 +187,6 @@ def get_coins() -> List[CoinConfig]:
     return coins
 
 
-# ======================================================================
-# Binance Client
-# ======================================================================
-class BinanceClient:
-    def __init__(self):
-        self.exchange = ccxt.binance({
-            'apiKey': BINANCE_API_KEY,
-            'secret': BINANCE_SECRET_KEY,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-
-    def fetch_ohlcv(self, symbol: str, timeframe: str = None, limit: int = None) -> Optional[List]:
-        tf = timeframe or config.get('TIMEFRAME')
-        lim = limit or config.get('MAX_CANDLES')
-        try:
-            return self.exchange.fetch_ohlcv(symbol, tf, limit=lim)
-        except Exception as e:
-            logger.error(f"Binance OHLCV error {symbol} {tf}: {e}")
-            return None
-
-    def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        try:
-            return self.exchange.fetch_ticker(symbol)
-        except Exception as e:
-            logger.error(f"Binance ticker error {symbol}: {e}")
-            return None
 
 
 # ======================================================================
@@ -599,7 +573,7 @@ class SignalManager:
         self.signals: Dict[str, CoinSignal] = {}
         self.history: List[Dict] = []
         self.last_update: Optional[datetime] = None
-        self.binance = BinanceClient()
+        self.market = MarketDataClient()
         self.lock = Lock()
         self.notification_manager = NotificationManager()
         self.fgi_fetcher = FearGreedFetcher()
@@ -846,6 +820,7 @@ class SignalManager:
         total_coins = len(get_coins())
         return {
             'total_coins': total_coins,
+            'exchange_status': signal_manager.market.get_status(),
             'updated_coins': len(coins),
             'avg_signal': avg,
             'strong_buy_signals': strong_buy,
@@ -938,6 +913,10 @@ def api_signals():
         'data': signal_manager.get_coins_data(),
         'timestamp': datetime.now().isoformat(),
     })
+
+@app.route('/api/exchange_status')
+def exchange_status():
+    return jsonify(signal_manager.market.get_status())
 
 
 @app.route('/api/update', methods=['POST'])
