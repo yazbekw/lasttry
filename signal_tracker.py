@@ -1,21 +1,75 @@
 """
-Signal Tracker - Dual backend (PostgreSQL / SQLite)
-- Lazy initialization: no DB connection until first real use
-- Broad exception handling: never crashes module import
-- Compatible with Python 3.10 - 3.12
+Crypto Signal Analyzer Bot - Discriminating Edition
+Version 8.2.0
 """
+
+print("=== APP2 IMPORT STARTING ===", flush=True)
 
 import os
 import json
+import time
 import sqlite3
 import logging
 import threading
+import requests
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
-from threading import Lock, RLock
-from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
 
+print("=== step 1: stdlib imported ===", flush=True)
+
+from flask import Flask, render_template, jsonify, request
+print("=== step 2: flask imported ===", flush=True)
+
+from config_manager import config
+print("=== step 3: config_manager imported ===", flush=True)
+
+from settings_metadata import SETTINGS_METADATA, SETTINGS_GROUPS
+print("=== step 4: settings_metadata imported ===", flush=True)
+
+from market_data import MarketDataClient, get_exchange_keys
+print("=== step 5: market_data imported ===", flush=True)
+
+from signal_tracker import SignalTracker, signal_tracker, USE_POSTGRES
+print("=== step 6: signal_tracker imported ===", flush=True)
+
+
+# ⚡ تعريف app فوراً
+app = Flask(__name__)
+print("=== step 7: Flask app created ===", flush=True)
+
+
+# ... logging setup ...
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+LOG_TO_FILE = os.environ.get('LOG_TO_FILE', 'false').lower() in ('true', '1', 'yes')
+
+_handlers = [logging.StreamHandler()]
+if LOG_TO_FILE:
+    try:
+        _handlers.append(logging.FileHandler('crypto_signal.log', encoding='utf-8'))
+    except Exception as e:
+        print(f"File logging disabled: {e}", flush=True)
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=_handlers,
+)
 logger = logging.getLogger(__name__)
+
+SECRET_KEY = os.environ.get('SECRET_KEY', 'crypto-signal-secret-2026')
+app.secret_key = SECRET_KEY
+print("=== step 8: secret key set ===", flush=True)
+
+
+# ======================================================================
+# ثم باقي الكود (SignalType, IndicatorCalculator, SignalManager, ...)
+# ======================================================================
+# ...
 
 
 # ======================================================================
