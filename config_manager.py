@@ -18,6 +18,7 @@ class ConfigManager:
     """Manages settings with runtime overrides saved to JSON file."""
 
     DEFAULTS: Dict[str, Any] = {
+        'EXCHANGE_PRIORITY': 'okx,bybit,kraken,binance',
         # General
         'COINS_LIST': "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,LTC/USDT",
         'TIMEFRAME': '15m',
@@ -51,6 +52,7 @@ class ConfigManager:
     TYPES: Dict[str, type] = {
         'MAX_CANDLES': int,
         'UPDATE_INTERVAL': int,
+        'EXCHANGE_PRIORITY': str,
         'USE_HTF_CONFIRMATION': bool,
         'BTC_BEARISH_DISCOUNT': float,
         'BTC_NEUTRAL_DISCOUNT': float,
