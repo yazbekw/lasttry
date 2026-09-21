@@ -239,7 +239,7 @@ footer {
             <div class="score-row">
                 <span>النتيجة المرجّحة:</span>
                 <span class="score-value">
-                    {{ "%+.2f"|format(coin.total_score) }} / 4.5
+                    {{ "%+.2f"|format(coin.total_score) }} / 7.8
                     ({{ "%+.1f"|format(coin.total_percentage) }}%)
                 </span>
             </div>
@@ -248,7 +248,12 @@ footer {
                 {% for ind in coin.indicators %}
                 <div class="indicator-row">
                     <span class="indicator-dot" style="background: {{ ind.color }};"></span>
-                    <span class="indicator-name">{{ ind.display_name }}</span>
+                    <span class="indicator-name">
+                        {{ ind.display_name }}
+                        {% if ind.name in ['rel_rsi','rel_strength','vol_momentum','atr_volatility','bb_position','macd_histogram'] %}
+                            <span style="font-size:0.7rem;color:var(--primary);margin-right:4px;">[جديد]</span>
+                        {% endif %}
+                    </span>
                     <span class="indicator-value
                         {% if ind.raw_score > 0 %}positive
                         {% elif ind.raw_score < 0 %}negative
