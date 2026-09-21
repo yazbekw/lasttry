@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Settings - إعدادات البوت</title>
+<style>
+:root {
+    --bg: #0f1419;
+    --card: #1a2332;
+    --border: #2a3a4d;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --primary: #2E86AB;
+    --success: #3BB273;
+    --warning: #e6a817;
+    --danger: #d64545;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    padding: 20px; max-width: 1100px; margin: 0 auto;
+}
+header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 20px 0; border-bottom: 2px solid var(--border); margin-bottom: 30px;
+}
+h1 { font-size: 1.6rem; }
+.back-btn {
+    background: var(--primary); color: white; padding: 8px 16px;
+    border-radius: 6px; text-decoration: none; font-size: 0.9rem;
+}
+.group {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; margin-bottom: 20px; overflow: hidden;
+}
+.group-header {
+    padding: 15px 20px; background: rgba(46,134,171,0.1);
+    border-bottom: 1px solid var(--border); font-size: 1.1rem; font-weight: 600;
+    display: flex; align-items: center; gap: 10px;
+}
+.group-body { padding: 20px; }
+.field { padding: 15px 0; border-bottom: 1px solid var(--border); }
+.field:last-child { border-bottom: none; }
+.field-label {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 6px; flex-wrap: wrap; gap: 8px;
+}
+.field-label strong { font-size: 1rem; }
+.field-label .key {
+    font-family: monospace; font-size: 0.8rem; color: var(--muted);
+    background: rgba(255,255,255,0.05); padding: 2px 8px; border-radius: 4px;
+}
+.field-help {
+    color: var(--muted); font-size: 0.88rem; margin-bottom: 10px;
+    white-space: pre-line;
+}
+.field input[type="text"],
+.field input[type="number"],
+.field select {
+    width: 100%; padding: 10px 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 0.95rem; font-family: inherit;
+}
+.field input:focus, .field select:focus {
+    outline: none; border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(46,134,171,0.2);
+}
+.toggle {
+    position: relative; display: inline-block; width: 50px; height: 26px;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background: #444; transition: 0.3s; border-radius: 26px;
+}
+.slider:before {
+    content: ""; position: absolute; height: 20px; width: 20px;
+    left: 3px; bottom: 3px; background: white; transition: 0.3s; border-radius: 50%;
+}
+.toggle input:checked + .slider { background: var(--success); }
+.toggle input:checked + .slider:before { transform: translateX(24px); }
+.actions {
+    position: sticky; bottom: 20px; display: flex; gap: 10px;
+    background: var(--card); padding: 15px; border-radius: 10px;
+    border: 1px solid var(--border); margin-top: 20px;
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.3);
+    flex-wrap: wrap;
+}
+button {
+    padding: 12px 24px; border: none; border-radius: 6px;
+    font-size: 0.95rem; font-weight: 600; cursor: pointer; font-family: inherit;
+}
+.btn-primary { background: var(--primary); color: white; flex: 1; min-width: 150px; }
+.btn-primary:hover { opacity: 0.9; }
+.btn-secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+.btn-danger { background: var(--danger); color: white; }
+.toast {
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    padding: 14px 24px; border-radius: 8px; color: white; font-weight: 600;
+    z-index: 999; opacity: 0; transition: opacity 0.3s, transform 0.3s;
+    pointer-events: none; max-width: 90%;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.success { background: var(--success); }
+.toast.error { background: var(--danger); }
+.toast.warning { background: var(--warning); color: #000; }
+</style>
+</head>
+<body>
+
+<header>
+    <h1>⚙️ إعدادات البوت</h1>
+    <a href="/" class="back-btn">← العودة للإشارات</a>
+</header>
+
+<div id="settings-container">
+    <p style="color:var(--muted);text-align:center;padding:40px;">جاري التحميل...</p>
+</div>
+
+<div class="actions">
+    <button class="btn-primary" onclick="saveSettings()">💾 حفظ الإعدادات</button>
+    <button class="btn-secondary" onclick="loadSettings()">🔄 إعادة تحميل</button>
+    <button class="btn-danger" onclick="resetSettings()">↩ استعادة الافتراضي</button>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let SETTINGS = {};
+let METADATA = {};
+let GROUPS = {};
+
+async function loadSettings() {
+    try {
+        const resp = await fetch('/api/config/full');
+        const data = await resp.json();
+        SETTINGS = data.values;
+        METADATA = data.metadata;
+        GROUPS = data.groups || {};
+        renderSettings();
+    } catch (e) {
+        showToast('فشل تحميل الإعدادات: ' + e.message, 'error');
+    }
+}
+
+function renderSettings() {
+    const grouped = {};
+    for (const [key, meta] of Object.entries(METADATA)) {
+        const g = meta.group || 'general';
+        if (!grouped[g]) grouped[g] = [];
+        grouped[g].push({ key, meta });
+    }
+
+    const sortedGroups = Object.entries(grouped).sort((a, b) => {
+        const oa = (GROUPS[a[0]] && GROUPS[a[0]].order) || 99;
+        const ob = (GROUPS[b[0]] && GROUPS[b[0]].order) || 99;
+        return oa - ob;
+    });
+
+    let html = '';
+    for (const [groupKey, fields] of sortedGroups) {
+        const groupInfo = GROUPS[groupKey] || { label: groupKey, icon: '⚙️' };
+        html += `<div class="group">
+            <div class="group-header">${groupInfo.icon || ''} ${groupInfo.label || groupKey}</div>
+            <div class="group-body">`;
+        for (const { key, meta } of fields) {
+            html += renderField(key, meta);
+        }
+        html += `</div></div>`;
+    }
+    document.getElementById('settings-container').innerHTML = html;
+}
+
+function renderField(key, meta) {
+    const val = SETTINGS[key];
+    const label = meta.label || key;
+    const help = meta.help || '';
+    let input = '';
+
+    if (meta.type === 'bool') {
+        input = `<label class="toggle">
+            <input type="checkbox" id="field_${key}" ${val ? 'checked' : ''}>
+            <span class="slider"></span>
+        </label>`;
+    } else if (meta.type === 'select') {
+        const opts = (meta.options || []).map(opt => {
+            const optLabel = (meta.option_labels && meta.option_labels[opt]) || opt;
+            const selected = String(val) === String(opt) ? 'selected' : '';
+            return `<option value="${opt}" ${selected}>${optLabel}</option>`;
+        }).join('');
+        input = `<select id="field_${key}">${opts}</select>`;
+    } else if (meta.type === 'number') {
+        const min = meta.min !== undefined ? `min="${meta.min}"` : '';
+        const max = meta.max !== undefined ? `max="${meta.max}"` : '';
+        const step = meta.step !== undefined ? `step="${meta.step}"` : 'step="any"';
+        input = `<input type="number" id="field_${key}" value="${val}" ${min} ${max} ${step}>`;
+    } else {
+        input = `<input type="text" id="field_${key}" value="${escapeHtml(val)}">`;
+    }
+
+    return `<div class="field">
+        <div class="field-label">
+            <strong>${label}</strong>
+            <span class="key">${key}</span>
+        </div>
+        <div class="field-help">${escapeHtml(help)}</div>
+        ${input}
+    </div>`;
+}
+
+function collectValues() {
+    const out = {};
+    for (const [key, meta] of Object.entries(METADATA)) {
+        const el = document.getElementById('field_' + key);
+        if (!el) continue;
+        if (meta.type === 'bool') {
+            out[key] = el.checked;
+        } else if (meta.type === 'number') {
+            const n = parseFloat(el.value);
+            out[key] = isNaN(n) ? SETTINGS[key] : n;
+        } else {
+            out[key] = el.value;
+        }
+    }
+    return out;
+}
+
+async function saveSettings() {
+    const values = collectValues();
+    try {
+        const resp = await fetch('/api/config/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(values),
+        });
+        const data = await resp.json();
+        if (data.status === 'success') {
+            showToast('✅ تم حفظ الإعدادات — سيُعاد التحديث تلقائياً', 'success');
+            SETTINGS = data.values;
+        } else if (data.status === 'warning') {
+            showToast('⚠️ ' + (data.errors || []).join(' | '), 'warning');
+            SETTINGS = data.values;
+        } else {
+            showToast('❌ ' + (data.message || 'فشل الحفظ'), 'error');
+        }
+    } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+    }
+}
+
+async function resetSettings() {
+    if (!confirm('هل أنت متأكد من استعادة الإعدادات الافتراضية؟')) return;
+    try {
+        const resp = await fetch('/api/config/reset', { method: 'POST' });
+        const data = await resp.json();
+        SETTINGS = data.values;
+        renderSettings();
+        showToast('↩ تم استعادة الإعدادات الافتراضية', 'success');
+    } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+    }
+}
+
+function showToast(msg, type) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + (type || 'success') + ' show';
+    setTimeout(() => { t.className = 'toast'; }, 3500);
+}
+
+function escapeHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+loadSettings();
+</script>
+</body>
+</html>
