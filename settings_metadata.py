@@ -236,6 +236,7 @@ SETTINGS_METADATA = {
 }
 
 SETTINGS_GROUPS = {
+    'exchange':   {'label': 'منصات البيانات',        'icon': '🌐', 'order': 0},
     'general':    {'label': 'الإعدادات العامة',       'icon': '⚙️', 'order': 1},
     'btc':        {'label': 'فلتر البيتكوين',          'icon': '₿',  'order': 2},
     'htf':        {'label': 'تأكيد الفريم الأعلى',     'icon': '📊', 'order': 3},
