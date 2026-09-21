@@ -18,6 +18,100 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 
+# Detect backend — with bulletproof exception handling
+# ======================================================================
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+USE_POSTGRES = False
+_psycopg2 = None
+
+if DATABASE_URL.startswith(('postgres://', 'postgresql://')):
+    try:
+        import psycopg2 as _psycopg2
+        import psycopg2.extras
+        USE_POSTGRES = True
+        logger.info("SignalTracker: PostgreSQL backend selected (Supabase)")
+    except BaseException as e:
+        logger.error(
+            f"psycopg2 import failed: {type(e).__name__}: {e}. "
+            f"Falling back to SQLite. To use PostgreSQL, ensure "
+            f"Python 3.12 or earlier (psycopg2-binary doesn't support 3.14 yet)."
+        )
+        _psycopg2 = None
+        USE_POSTGRES = False
+else:
+    logger.info("SignalTracker: SQLite backend selected (no DATABASE_URL)")
+
+
+# ======================================================================
+# SQLite path
+# ======================================================================
+def _sqlite_path() -> str:
+    env = os.environ.get('SIGNAL_TRACKER_DB')
+    if env:
+        return env
+    if os.path.isdir('/data'):
+        return '/data/signals.db'
+    return 'signals.db'
+
+
+# ======================================================================
+# Connection wrappers
+# ======================================================================
+class _PgConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params: Tuple = ()):
+        sql = sql.replace('?', '%s')
+        cur = self._conn.cursor(cursor_factory=_psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def executescript(self, script: str):
+        cur = self._conn.cursor()
+        for stmt in script.split(';'):
+            stmt = stmt.strip()
+            if stmt:
+                cur.execute(stmt)
+        self._conn.commit()
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        try:
+            self._conn.commit()
+        finally:
+            self._conn.close()
+
+
+@contextmanager
+def _get_conn():
+    if USE_POSTGRES and _psycopg2 is not None:
+        raw = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        try:
+            yield _PgConnection(raw)
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
+    else:
+        conn = sqlite3.connect(_sqlite_path(), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
 # ======================================================================
 # Detect backend
 # ======================================================================
