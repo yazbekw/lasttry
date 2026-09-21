@@ -1,6 +1,6 @@
 """
 Crypto Signal Analyzer Bot - Weighted Edition
-Version 6.0.0 - Weighted Scoring + SELL Signals + BTC as Modifier + Web UI Settings
+Version 6.1.0 - Multi-Exchange + API Keys + Weighted Scoring + Web UI Settings
 All notifications in English, no emojis.
 """
 
@@ -16,11 +16,10 @@ from enum import Enum
 from threading import Lock
 
 from flask import Flask, render_template, jsonify, request
-import ccxt
 
 from config_manager import config
 from settings_metadata import SETTINGS_METADATA, SETTINGS_GROUPS
-from market_data import MarketDataClient
+from market_data import MarketDataClient, get_exchange_keys
 
 # ======================================================================
 # Logging setup
@@ -41,8 +40,6 @@ logger = logging.getLogger(__name__)
 # ======================================================================
 # Static application values (not changeable from UI)
 # ======================================================================
-BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
-BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
 NTFY_TOPIC = os.environ.get('NTFY_TOPIC', 'crypto_buy_alerts')
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
 FGI_API_URL = "https://api.alternative.me/fng/"
@@ -185,8 +182,6 @@ def get_coins() -> List[CoinConfig]:
             quote_asset=quote,
         ))
     return coins
-
-
 
 
 # ======================================================================
@@ -566,20 +561,37 @@ class NotificationManager:
 
 
 # ======================================================================
-# Signal Manager
+# Signal Manager (with dynamic market client)
 # ======================================================================
 class SignalManager:
     def __init__(self):
         self.signals: Dict[str, CoinSignal] = {}
         self.history: List[Dict] = []
         self.last_update: Optional[datetime] = None
-        self.market = MarketDataClient()
         self.lock = Lock()
         self.notification_manager = NotificationManager()
         self.fgi_fetcher = FearGreedFetcher()
         self.fear_greed_index = 50
         self.btc_bullish = False
         self.btc_trend_label = "unknown"
+        self._market: Optional[MarketDataClient] = None
+        self._market_priority: str = ""
+
+    @property
+    def market(self) -> MarketDataClient:
+        """Rebuild client if priority changed in settings."""
+        priority = config.get('EXCHANGE_PRIORITY')
+        if self._market is None or priority != self._market_priority:
+            names = [n.strip() for n in priority.split(',') if n.strip()]
+            keys = get_exchange_keys()
+            self._market = MarketDataClient(names, keys)
+            self._market_priority = priority
+            authed = [n for n in names if n in keys]
+            logger.info(
+                f"MarketDataClient initialized with: {names} | "
+                f"Authenticated: {authed or 'none'}"
+            )
+        return self._market
 
     def _trend_label(self, closes: List[float]) -> str:
         if len(closes) < 200:
@@ -598,7 +610,7 @@ class SignalManager:
 
     def check_btc_trend(self) -> Tuple[bool, str]:
         try:
-            ohlcv = self.binance.fetch_ohlcv("BTC/USDT", config.get('TIMEFRAME'), 250)
+            ohlcv = self.market.fetch_ohlcv("BTC/USDT", config.get('TIMEFRAME'), 250)
             if not ohlcv or len(ohlcv) < 200:
                 return False, "unknown"
             closes = [c[4] for c in ohlcv]
@@ -612,7 +624,7 @@ class SignalManager:
         if not config.get('USE_HTF_CONFIRMATION'):
             return "unknown"
         try:
-            ohlcv = self.binance.fetch_ohlcv(symbol, config.get('HTF_TIMEFRAME'), 250)
+            ohlcv = self.market.fetch_ohlcv(symbol, config.get('HTF_TIMEFRAME'), 250)
             if not ohlcv or len(ohlcv) < 200:
                 return "unknown"
             closes = [c[4] for c in ohlcv]
@@ -649,8 +661,8 @@ class SignalManager:
             return success > 0
 
     def _process_coin(self, coin: CoinConfig) -> Optional[CoinSignal]:
-        ohlcv = self.binance.fetch_ohlcv(coin.symbol, config.get('TIMEFRAME'),
-                                         config.get('MAX_CANDLES'))
+        ohlcv = self.market.fetch_ohlcv(coin.symbol, config.get('TIMEFRAME'),
+                                        config.get('MAX_CANDLES'))
         if not ohlcv or len(ohlcv) < 50:
             return None
 
@@ -659,7 +671,7 @@ class SignalManager:
         lows = [c[3] for c in ohlcv]
         volumes = [c[5] for c in ohlcv]
 
-        ticker = self.binance.fetch_ticker(coin.symbol)
+        ticker = self.market.fetch_ticker(coin.symbol)
         if not ticker:
             return None
 
@@ -820,7 +832,6 @@ class SignalManager:
         total_coins = len(get_coins())
         return {
             'total_coins': total_coins,
-            'exchange_status': signal_manager.market.get_status(),
             'updated_coins': len(coins),
             'avg_signal': avg,
             'strong_buy_signals': strong_buy,
@@ -834,12 +845,14 @@ class SignalManager:
             'btc_bullish': self.btc_bullish,
             'btc_trend': self.btc_trend_label,
             'system_status': 'healthy' if len(coins) >= total_coins * 0.7 else 'warning',
+            'exchange_status': self.market.get_status() if self._market else {},
             'config': {
                 'timeframe': config.get('TIMEFRAME'),
                 'htf_timeframe': config.get('HTF_TIMEFRAME'),
                 'btc_filter_mode': config.get('USE_BTC_FILTER'),
                 'htf_confirmation': config.get('USE_HTF_CONFIRMATION'),
                 'update_interval': config.get('UPDATE_INTERVAL'),
+                'exchange_priority': config.get('EXCHANGE_PRIORITY'),
             }
         }
 
@@ -914,10 +927,6 @@ def api_signals():
         'timestamp': datetime.now().isoformat(),
     })
 
-@app.route('/api/exchange_status')
-def exchange_status():
-    return jsonify(signal_manager.market.get_status())
-
 
 @app.route('/api/update', methods=['POST'])
 def manual_update():
@@ -944,7 +953,7 @@ def health():
         'btc_bullish': signal_manager.btc_bullish,
         'btc_trend': signal_manager.btc_trend_label,
         'notifications': len(signal_manager.notification_manager.history),
-        'version': '6.0.0-weighted',
+        'version': '6.1.0-multiexchange',
     })
 
 
@@ -956,6 +965,16 @@ def get_notifications():
         'notifications': [asdict(n) for n in nots],
         'total': len(signal_manager.notification_manager.history),
     })
+
+
+@app.route('/api/exchange_status')
+def exchange_status():
+    """Detailed exchange status for monitoring and debugging."""
+    status = signal_manager.market.get_status()
+    keys = get_exchange_keys()
+    for ex in status.get('exchanges', []):
+        ex['has_keys'] = ex['name'] in keys
+    return jsonify(status)
 
 
 @app.route('/api/config/full')
@@ -1009,12 +1028,15 @@ def send_startup_notification():
         mode = config.get('USE_BTC_FILTER')
         htf = "ON" if config.get('USE_HTF_CONFIRMATION') else "OFF"
         coins = get_coins()
+        keys = get_exchange_keys()
         msg = (
-            f"Crypto Weighted Signal Analyzer Started (v6.0)\n"
+            f"Crypto Weighted Signal Analyzer Started (v6.1)\n"
             f"Tracking {len(coins)} coins\n"
             f"Timeframe: {config.get('TIMEFRAME')} | HTF: {config.get('HTF_TIMEFRAME')}\n"
             f"BTC filter mode: {mode}\n"
             f"HTF confirmation: {htf}\n"
+            f"Exchange priority: {config.get('EXCHANGE_PRIORITY')}\n"
+            f"API keys configured: {list(keys.keys()) or 'none'}\n"
             f"Update interval: {config.get('UPDATE_INTERVAL')}s\n"
             f"Signals: STRONG BUY / BUY / NEUTRAL / SELL / STRONG SELL"
         )
@@ -1036,10 +1058,12 @@ threading.Thread(target=delayed_startup, daemon=True).start()
 # ======================================================================
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("Crypto Weighted Signal Analyzer v6.0.0")
+    logger.info("Crypto Weighted Signal Analyzer v6.1.0 (Multi-Exchange)")
     logger.info(f"Coins: {[c.symbol for c in get_coins()]}")
     logger.info(f"Timeframe: {config.get('TIMEFRAME')} | HTF: {config.get('HTF_TIMEFRAME')}")
     logger.info(f"BTC filter: {config.get('USE_BTC_FILTER')} | HTF confirm: {config.get('USE_HTF_CONFIRMATION')}")
+    logger.info(f"Exchange priority: {config.get('EXCHANGE_PRIORITY')}")
+    logger.info(f"API keys: {list(get_exchange_keys().keys()) or 'none'}")
     logger.info(f"NTFY: {NTFY_URL}")
     logger.info(f"Port: {PORT}")
     logger.info("=" * 60)
