@@ -1,10 +1,8 @@
 """
 Crypto Signal Analyzer Bot - Discriminating Edition
-Version 8.2.0 - Debug tracing + Early Flask app + Parallel fetch
+Version 8.3.0 - Batch weights + async /api/update + connection pooling
 All notifications in English, no emojis.
 """
-
-print("=== APP2 IMPORT STARTING ===", flush=True)
 
 import os
 import json
@@ -21,34 +19,22 @@ from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 
-print("=== step 1: stdlib imported ===", flush=True)
-
 from flask import Flask, render_template, jsonify, request
-print("=== step 2: flask imported ===", flush=True)
 
 from config_manager import config
-print("=== step 3: config_manager imported ===", flush=True)
-
 from settings_metadata import SETTINGS_METADATA, SETTINGS_GROUPS
-print("=== step 4: settings_metadata imported ===", flush=True)
-
 from market_data import MarketDataClient, get_exchange_keys
-print("=== step 5: market_data imported ===", flush=True)
-
 from signal_tracker import SignalTracker, signal_tracker, USE_POSTGRES
-print("=== step 6: signal_tracker imported ===", flush=True)
 
 
 # ======================================================================
-# ⚡ Create Flask app IMMEDIATELY after imports
-# This guarantees `app2:app` exists even if later code fails
+# Flask app (defined early so gunicorn can always find it)
 # ======================================================================
 app = Flask(__name__)
-print("=== step 7: Flask app created ===", flush=True)
 
 
 # ======================================================================
-# Logging setup — file logging optional (Render Free uses ephemeral FS)
+# Logging setup
 # ======================================================================
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 LOG_TO_FILE = os.environ.get('LOG_TO_FILE', 'false').lower() in ('true', '1', 'yes')
@@ -66,8 +52,6 @@ logging.basicConfig(
     handlers=_handlers,
 )
 logger = logging.getLogger(__name__)
-
-print("=== step 8: logging configured ===", flush=True)
 
 
 # ======================================================================
@@ -97,7 +81,6 @@ STARTUP_NOTIFY_DELAY = int(os.environ.get('STARTUP_NOTIFY_DELAY', '30'))
 FETCH_MAX_WORKERS = int(os.environ.get('FETCH_MAX_WORKERS', '3'))
 
 app.secret_key = SECRET_KEY
-print("=== step 9: secret key set ===", flush=True)
 
 COIN_NAMES = {
     "BTC/USDT": "Bitcoin", "ETH/USDT": "Ethereum", "BNB/USDT": "Binance Coin",
@@ -571,14 +554,28 @@ class SignalProcessor:
 
     @staticmethod
     def _get_weights(tracker: Optional[SignalTracker]) -> Dict[str, float]:
+        """
+        Return weights per indicator, adjusted by historical accuracy.
+        Uses a SINGLE batch query for all indicators (not N queries).
+        """
         base = {k: 1.0 for k in BASE_MAX_PER_INDICATOR}
+
         if not _cfg('USE_DYNAMIC_WEIGHTS', True) or tracker is None:
+            return base
+
+        try:
+            all_stats = tracker.get_all_indicator_stats_batch()
+        except Exception as e:
+            logger.warning(f"batch stats fetch failed: {e}")
+            return base
+
+        if not all_stats:
             return base
 
         min_samples = _cfg('DYNAMIC_WEIGHTS_MIN_SAMPLES', 20)
         adjusted: Dict[str, float] = {}
         for name in base:
-            stats = tracker.get_indicator_stats(name)
+            stats = all_stats.get(name, {'wins': 0, 'losses': 0, 'total': 0})
             if stats['total'] >= min_samples and stats['total'] > 0:
                 wr = stats['wins'] / stats['total']
                 adjusted[name] = 0.5 + wr
@@ -594,8 +591,11 @@ class SignalProcessor:
 
     @staticmethod
     def process(raw_scores, btc_bullish, btc_label, htf_trend,
-                mtf_score: float = 0.0, tracker=None) -> Dict:
-        weights = SignalProcessor._get_weights(tracker)
+                mtf_score: float = 0.0, tracker=None, weights=None) -> Dict:
+        # Use passed weights if provided (avoids per-coin DB query)
+        if weights is None:
+            weights = SignalProcessor._get_weights(tracker)
+
         weighted = {k: raw_scores[k] * weights.get(k, 1.0) for k in raw_scores}
         total = sum(weighted.values())
 
@@ -992,8 +992,14 @@ class SignalManager:
         return total, details
 
     def _fetch_base(self, coin: CoinConfig) -> Optional[Dict]:
-        ohlcv = self.market.fetch_ohlcv(coin.symbol, config.get('TIMEFRAME'),
-                                        config.get('MAX_CANDLES'))
+        try:
+            ohlcv = self.market.fetch_ohlcv(
+                coin.symbol, config.get('TIMEFRAME'), config.get('MAX_CANDLES')
+            )
+        except Exception as e:
+            logger.warning(f"ohlcv fetch failed {coin.symbol}: {e}")
+            return None
+
         if not ohlcv or len(ohlcv) < 50:
             return None
 
@@ -1002,7 +1008,11 @@ class SignalManager:
         lows = [c[3] for c in ohlcv]
         volumes = [c[5] for c in ohlcv]
 
-        ticker = self.market.fetch_ticker(coin.symbol)
+        try:
+            ticker = self.market.fetch_ticker(coin.symbol)
+        except Exception as e:
+            logger.warning(f"ticker fetch failed {coin.symbol}: {e}")
+            return None
         if not ticker:
             return None
 
@@ -1056,7 +1066,7 @@ class SignalManager:
                     logger.error(f"Fetch error on {coin.symbol}: {e}")
         return results
 
-    def _finalize_signal(self, data, market_avg_rsi, btc_change_24h):
+    def _finalize_signal(self, data, market_avg_rsi, btc_change_24h, weights=None):
         coin = data['coin']
         closes = data['closes']
         highs = data['highs']
@@ -1085,7 +1095,8 @@ class SignalManager:
 
         result = SignalProcessor.process(
             raw_scores, self.btc_bullish, self.btc_trend_label,
-            htf, mtf_score=mtf_score, tracker=self.tracker
+            htf, mtf_score=mtf_score, tracker=self.tracker,
+            weights=weights,
         )
 
         entry_price = ticker.get('last', 0.0) or 0.0
@@ -1125,6 +1136,14 @@ class SignalManager:
 
             self.fear_greed_index = self.fgi_fetcher.get()
 
+            # ⚡ Compute weights ONCE per update cycle (1 batch query)
+            try:
+                weights = SignalProcessor._get_weights(self.tracker)
+                logger.info(f"Weights computed for {len(weights)} indicators")
+            except Exception as e:
+                logger.warning(f"Weights computation failed, using defaults: {e}")
+                weights = {k: 1.0 for k in BASE_MAX_PER_INDICATOR}
+
             intermediate = self._fetch_all_parallel(coins)
 
             if not intermediate:
@@ -1150,7 +1169,9 @@ class SignalManager:
             current_prices: Dict[str, float] = {}
             for data in intermediate:
                 try:
-                    sig = self._finalize_signal(data, market_avg_rsi, btc_change_24h)
+                    sig = self._finalize_signal(
+                        data, market_avg_rsi, btc_change_24h, weights=weights
+                    )
                     if sig and sig.is_valid:
                         self.signals[data['coin'].symbol] = sig
                         success += 1
@@ -1340,6 +1361,7 @@ class UpdateScheduler:
         self._thread: Optional[threading.Thread] = None
         self._last_run: Optional[datetime] = None
         self._initial_delay = max(0, INITIAL_UPDATE_DELAY)
+        self._run_lock = Lock()  # prevent overlapping update_all calls
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -1352,11 +1374,17 @@ class UpdateScheduler:
         )
 
     def _run_once(self):
+        # Skip if another run is in progress
+        if not self._run_lock.acquire(blocking=False):
+            logger.debug("update_all already running — skipping this tick")
+            return
         try:
             self.manager.update_all()
             self._last_run = datetime.now()
         except Exception as e:
             logger.error(f"Update error: {e}")
+        finally:
+            self._run_lock.release()
 
     def _run(self):
         if self._stop.wait(timeout=self._initial_delay):
@@ -1380,24 +1408,28 @@ class UpdateScheduler:
         if self._thread:
             self._thread.join(timeout=5)
 
+    def run_in_background(self):
+        """Trigger one update in a separate thread (non-blocking)."""
+        threading.Thread(
+            target=self._run_once,
+            daemon=True,
+            name="ManualUpdate"
+        ).start()
+
 
 # ======================================================================
-# Initialize SignalManager (after all classes are defined)
+# Initialize SignalManager
 # ======================================================================
-print("=== step 10: creating SignalManager ===", flush=True)
 try:
     signal_manager = SignalManager()
-    print("=== step 11: SignalManager created ===", flush=True)
     scheduler = UpdateScheduler(signal_manager)
-    print("=== step 12: scheduler created ===", flush=True)
     start_time = time.time()
     scheduler.start()
-    print("=== step 13: scheduler started ===", flush=True)
+    logger.info("SignalManager and scheduler initialized")
 except Exception as e:
     import traceback
-    print(f"=== FATAL: SignalManager init failed: {e} ===", flush=True)
+    logger.error(f"FATAL: SignalManager init failed: {e}")
     traceback.print_exc()
-    # Do NOT re-raise — keep `app` alive so gunicorn binds
     signal_manager = None
     scheduler = None
     start_time = time.time()
@@ -1452,14 +1484,17 @@ def api_signals():
 
 @app.route('/api/update', methods=['POST'])
 def manual_update():
-    if signal_manager is None:
+    """Trigger update in background. Returns immediately (202 Accepted)."""
+    if signal_manager is None or scheduler is None:
         return jsonify({'status': 'error', 'message': 'not initialized'}), 503
-    ok = signal_manager.update_all()
+
+    scheduler.run_in_background()
+
     return jsonify({
-        'status': 'success' if ok else 'warning',
-        'message': 'Update completed',
+        'status': 'accepted',
+        'message': 'Update started in background. Check /api/health in ~30s.',
         'timestamp': datetime.now().isoformat(),
-    })
+    }), 202
 
 
 @app.route('/api/health')
@@ -1469,7 +1504,7 @@ def health():
             'status': 'error',
             'message': 'SignalManager failed to initialize — see logs',
             'uptime': time.time() - start_time,
-            'version': '8.2.0',
+            'version': '8.3.0',
         }), 503
 
     last = signal_manager.last_update
@@ -1488,7 +1523,7 @@ def health():
         'btc_bullish': signal_manager.btc_bullish,
         'btc_trend': signal_manager.btc_trend_label,
         'notifications': len(signal_manager.notification_manager.history),
-        'version': '8.2.0',
+        'version': '8.3.0',
         'indicators_count': 10,
         'tracker': signal_manager.tracker.health_check(),
         'max_total_score': MAX_TOTAL_SCORE,
@@ -1596,7 +1631,7 @@ def test_ntfy():
 def send_startup_notification():
     try:
         if signal_manager is None:
-            print("=== Cannot send startup notification: signal_manager is None ===", flush=True)
+            logger.warning("Cannot send startup notification: signal_manager is None")
             return
         mode = config.get('USE_BTC_FILTER')
         htf = "ON" if config.get('USE_HTF_CONFIRMATION') else "OFF"
@@ -1607,7 +1642,7 @@ def send_startup_notification():
         coins = get_coins()
         keys = get_exchange_keys()
         msg = (
-            f"Crypto Discriminating Analyzer Started (v8.2)\n"
+            f"Crypto Discriminating Analyzer Started (v8.3)\n"
             f"Tracking {len(coins)} coins\n"
             f"Indicators: 10 (4 base + 6 relative)\n"
             f"Max score: {MAX_TOTAL_SCORE}\n"
@@ -1653,15 +1688,12 @@ for _sig in (_signal_sys.SIGTERM, _signal_sys.SIGINT):
         pass
 
 
-print("=== APP2 IMPORT COMPLETE ===", flush=True)
-
-
 # ======================================================================
 # Entry point (local run only)
 # ======================================================================
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("Crypto Discriminating Analyzer v8.2.0 (local run)")
+    logger.info("Crypto Discriminating Analyzer v8.3.0 (local run)")
     logger.info(f"Backend: {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
     logger.info(f"Coins: {[c.symbol for c in get_coins()]}")
     logger.info(f"Max total score: {MAX_TOTAL_SCORE}")
