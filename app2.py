@@ -1706,6 +1706,77 @@ def clear_notifications():
     signal_manager.notification_manager.clear_history()
     return jsonify({'status': 'success'})
 
+@app.route('/api/external_bot_debug')
+def external_bot_debug():
+    """Diagnostic endpoint — shows external bot config & tests sending."""
+    import os
+    try:
+        from external_bot import external_bot
+        # Reload config in case it changed
+        external_bot.reload_config()
+
+        # Show what config_manager sees
+        from config_manager import config as cfg
+        debug = {
+            'config_values': {
+                'EXTERNAL_BOT_ENABLED': cfg.get('EXTERNAL_BOT_ENABLED'),
+                'EXTERNAL_BOT_URL': cfg.get('EXTERNAL_BOT_URL'),
+                'EXTERNAL_BOT_SECRET_set': bool(cfg.get('EXTERNAL_BOT_SECRET')),
+                'EXTERNAL_BOT_SECRET_length': len(cfg.get('EXTERNAL_BOT_SECRET') or ''),
+                'EXTERNAL_BOT_NOTIFY_STATE_CHANGE': cfg.get('EXTERNAL_BOT_NOTIFY_STATE_CHANGE'),
+                'STATE_CHANGE_THRESHOLD': cfg.get('STATE_CHANGE_THRESHOLD'),
+            },
+            'external_bot_instance': {
+                'enabled': external_bot.enabled,
+                'url': external_bot.url,
+                'secret_set': bool(external_bot.secret),
+                'secret_length': len(external_bot.secret or ''),
+                'notify_state_change': external_bot.notify_state_change,
+            },
+            'env_vars_raw': {
+                'EXTERNAL_BOT_ENABLED': os.environ.get('EXTERNAL_BOT_ENABLED'),
+                'EXTERNAL_BOT_URL': os.environ.get('EXTERNAL_BOT_URL'),
+                'EXTERNAL_BOT_SECRET_len': len(os.environ.get('EXTERNAL_BOT_SECRET') or ''),
+            },
+            'sources': cfg.describe_env_sources() if hasattr(cfg, 'describe_env_sources') else {},
+        }
+
+        # If enabled, do a live test and return the result
+        if external_bot.enabled and external_bot.url:
+            test_result = external_bot._post('entry', {
+                'symbol': 'DEBUG/USDT',
+                'name': 'Debug',
+                'signal_type': 'BUY',
+                'direction': 'long',
+                'entry_price': 100.0,
+                'score': 3.5,
+                'percentage': 50.0,
+                'confidence': 50.0,
+                'stop_loss': 98.0,
+                'take_profit': 104.0,
+                'risk_reward_ratio': 2.0,
+                'suggested_position_usd': 50.0,
+                'risk_amount_usd': 10.0,
+                'btc_bullish': True,
+                'htf_trend': 'bullish',
+                'fear_greed': 50,
+                'atr_value': 1.5,
+                'mtf_details': {},
+                'price_change_24h': 0.0,
+            })
+            debug['test_send_result'] = test_result
+        else:
+            debug['test_send_result'] = 'skipped — not enabled or no URL'
+
+        return jsonify({'status': 'success', 'debug': debug})
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'traceback': traceback.format_exc(),
+        }), 500
+
 
 @app.route('/api/exchange_status')
 def exchange_status():
