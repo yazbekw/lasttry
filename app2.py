@@ -1,13 +1,15 @@
 """
 Crypto Signal Analyzer Bot - Discriminating Edition
-Version 8.3.0 - Batch weights + async /api/update + connection pooling
-All notifications in English, no emojis.
+Version 8.4.0
+- Fixed: sell signals now appear in bull markets
+- Added: external bot webhook (entry + state change)
+- Added: ML-ready feature storage
+- Optimized: batch queries + pooling + async /api/update
 """
 
 import os
 import json
 import time
-import sqlite3
 import logging
 import threading
 import requests
@@ -17,7 +19,6 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import OrderedDict
 
 from flask import Flask, render_template, jsonify, request
 
@@ -25,16 +26,17 @@ from config_manager import config
 from settings_metadata import SETTINGS_METADATA, SETTINGS_GROUPS
 from market_data import MarketDataClient, get_exchange_keys
 from signal_tracker import SignalTracker, signal_tracker, USE_POSTGRES
+from external_bot import external_bot
 
 
 # ======================================================================
-# Flask app (defined early so gunicorn can always find it)
+# Flask app
 # ======================================================================
 app = Flask(__name__)
 
 
 # ======================================================================
-# Logging setup
+# Logging
 # ======================================================================
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 LOG_TO_FILE = os.environ.get('LOG_TO_FILE', 'false').lower() in ('true', '1', 'yes')
@@ -66,7 +68,7 @@ def _cfg(key: str, default=None):
 
 
 # ======================================================================
-# Static application values
+# Static values
 # ======================================================================
 NTFY_TOPIC = os.environ.get('NTFY_TOPIC', 'crypto_buy_alerts')
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
@@ -75,7 +77,6 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'crypto-signal-secret-2026')
 FLASK_DEBUG = os.environ.get('FLASK_DEBUG', 'false').lower() in ('true', '1', 'yes')
 PORT = int(os.environ.get('PORT', 5000))
 
-# Timings tuned for Render Free
 INITIAL_UPDATE_DELAY = int(os.environ.get('INITIAL_UPDATE_DELAY', '20'))
 STARTUP_NOTIFY_DELAY = int(os.environ.get('STARTUP_NOTIFY_DELAY', '30'))
 FETCH_MAX_WORKERS = int(os.environ.get('FETCH_MAX_WORKERS', '3'))
@@ -94,7 +95,7 @@ COIN_NAMES = {
 
 
 # ======================================================================
-# Data structures
+# Enums + Dataclasses
 # ======================================================================
 class SignalType(Enum):
     STRONG_BUY = "STRONG BUY"
@@ -182,6 +183,9 @@ class CoinSignal:
     risk_reward_ratio: float = 0.0
     risk_amount_usd: float = 0.0
     suggested_position_usd: float = 0.0
+    # For ML / state tracking
+    btc_trend_label: str = "unknown"
+    market_regime: str = "unknown"
 
 
 @dataclass
@@ -259,7 +263,7 @@ def get_coins() -> List[CoinConfig]:
 
 
 # ======================================================================
-# Fear & Greed Fetcher
+# Fear & Greed
 # ======================================================================
 class FearGreedFetcher:
     def __init__(self):
@@ -387,18 +391,30 @@ class IndicatorCalculator:
 
     @staticmethod
     def momentum_score(close_prices):
+        """
+        Symmetric RSI scoring.
+        Buy zones:  <25 → +1.0, <35 → +0.75, <45 → +0.35
+        Neutral:    45-55 → 0.0
+        Sell zones: >55 → -0.35, >65 → -0.75, >75 → -1.0
+        """
         if len(close_prices) < 15:
             return 0.0
         try:
             rsi_vals = IndicatorCalculator.rsi(close_prices, 14)
             rsi = rsi_vals[-1] if rsi_vals and rsi_vals[-1] is not None else 50.0
-            if rsi < config.get('RSI_OVERSOLD_STRONG'): return 1.0
-            if rsi < config.get('RSI_OVERSOLD'): return 0.75
-            if rsi < 50: return 0.25
-            if rsi > config.get('RSI_OVERBOUGHT_STRONG'): return -1.0
-            if rsi > config.get('RSI_OVERBOUGHT'): return -0.75
-            if rsi > 50: return -0.25
-            return 0.0
+
+            # Buy side
+            if rsi < 25: return 1.0
+            if rsi < 35: return 0.75
+            if rsi < 45: return 0.35
+
+            # Neutral
+            if rsi <= 55: return 0.0
+
+            # Sell side (now symmetric)
+            if rsi <= 65: return -0.35
+            if rsi <= 75: return -0.75
+            return -1.0
         except Exception:
             return 0.0
 
@@ -424,12 +440,17 @@ class IndicatorCalculator:
 
     @staticmethod
     def structure_score(highs, lows, close_prices, lookback: int = 20):
+        """
+        Breakout/breakdown detection. Also uses a wider lookback
+        to detect support breakdown in bull markets.
+        """
         if len(highs) < lookback + 1 or len(lows) < lookback + 1:
             return 0.0
         try:
             recent_high = max(highs[-lookback-1:-1])
             recent_low = min(lows[-lookback-1:-1])
             price = close_prices[-1]
+
             if price > recent_high: return 1.0
             if price < recent_low: return -1.0
             if price > recent_high * 0.98: return 0.5
@@ -554,21 +575,13 @@ class SignalProcessor:
 
     @staticmethod
     def _get_weights(tracker: Optional[SignalTracker]) -> Dict[str, float]:
-        """
-        Return weights per indicator, adjusted by historical accuracy.
-        Uses a SINGLE batch query for all indicators (not N queries).
-        """
         base = {k: 1.0 for k in BASE_MAX_PER_INDICATOR}
-
         if not _cfg('USE_DYNAMIC_WEIGHTS', True) or tracker is None:
             return base
-
         try:
             all_stats = tracker.get_all_indicator_stats_batch()
-        except Exception as e:
-            logger.warning(f"batch stats fetch failed: {e}")
+        except Exception:
             return base
-
         if not all_stats:
             return base
 
@@ -592,7 +605,6 @@ class SignalProcessor:
     @staticmethod
     def process(raw_scores, btc_bullish, btc_label, htf_trend,
                 mtf_score: float = 0.0, tracker=None, weights=None) -> Dict:
-        # Use passed weights if provided (avoids per-coin DB query)
         if weights is None:
             weights = SignalProcessor._get_weights(tracker)
 
@@ -605,16 +617,22 @@ class SignalProcessor:
             if not btc_bullish:
                 return SignalProcessor._build_result(
                     0.0, weighted, weights, raw_scores,
-                    forced_neutral=True, mtf_score=mtf_score
+                    forced_neutral=True, mtf_score=mtf_score,
+                    btc_bullish=btc_bullish,
                 )
+
         elif btc_mode == 'modify':
             if total > 0 and not btc_bullish:
                 total *= (_cfg('BTC_BEARISH_DISCOUNT', 0.5)
                           if btc_label == "bearish"
                           else _cfg('BTC_NEUTRAL_DISCOUNT', 0.75))
-            elif total < 0 and not btc_bullish:
-                total *= 1.15
+            elif total < 0:
+                if not btc_bullish:
+                    total *= 1.15
+                elif _cfg('ALLOW_SELLS_IN_BULL_MARKET', True):
+                    total *= _cfg('SELL_BULL_BOOST', 1.10)
 
+        # HTF confirmation
         if _cfg('USE_HTF_CONFIRMATION', True) and total != 0 and not _cfg('USE_MTF_CONFIRMATION', False):
             agrees = ((total > 0 and htf_trend == "bullish") or
                       (total < 0 and htf_trend == "bearish"))
@@ -625,6 +643,7 @@ class SignalProcessor:
             elif disagrees:
                 total *= _cfg('HTF_PENALTY', 0.85)
 
+        # MTF confirmation
         if _cfg('USE_MTF_CONFIRMATION', False) and total != 0:
             influence = _cfg('MTF_INFLUENCE', 0.3)
             total *= (1.0 + mtf_score * influence)
@@ -632,12 +651,14 @@ class SignalProcessor:
         total = max(-MAX_TOTAL_SCORE, min(MAX_TOTAL_SCORE, total))
         return SignalProcessor._build_result(
             total, weighted, weights, raw_scores,
-            forced_neutral=False, mtf_score=mtf_score
+            forced_neutral=False, mtf_score=mtf_score,
+            btc_bullish=btc_bullish,
         )
 
     @staticmethod
     def _build_result(total, weighted, weights, raw_scores,
-                      forced_neutral=False, mtf_score=0.0) -> Dict:
+                      forced_neutral=False, mtf_score=0.0,
+                      btc_bullish=True) -> Dict:
         if forced_neutral:
             signal_type = SignalType.NEUTRAL
         elif total >= config.get('STRONG_BUY_THRESHOLD'):
@@ -649,7 +670,12 @@ class SignalProcessor:
         elif total <= config.get('SELL_THRESHOLD'):
             signal_type = SignalType.SELL
         else:
-            signal_type = SignalType.NEUTRAL
+            # Bull-market-specific sell threshold (easier)
+            if (btc_bullish and _cfg('ALLOW_SELLS_IN_BULL_MARKET', True)
+                    and total <= _cfg('SELL_THRESHOLD_BULL', -1.8)):
+                signal_type = SignalType.SELL
+            else:
+                signal_type = SignalType.NEUTRAL
 
         total_percentage = (total / MAX_TOTAL_SCORE) * 100.0
         strength = SignalProcessor.get_signal_strength(signal_type)
@@ -991,6 +1017,30 @@ class SignalManager:
             total += v * w
         return total, details
 
+    # ------------------------------------------------------------------
+    def _compute_market_regime(self, btc_change_24h: float) -> str:
+        """
+        Classify current market regime:
+        - 'strong_bull': BTC +3% or more in 24h
+        - 'bull': BTC +1% to +3%
+        - 'ranging': BTC -1% to +1%
+        - 'bear': BTC -1% to -3%
+        - 'strong_bear': BTC -3% or less
+        """
+        try:
+            if btc_change_24h >= 3.0:
+                return 'strong_bull'
+            if btc_change_24h >= 1.0:
+                return 'bull'
+            if btc_change_24h <= -3.0:
+                return 'strong_bear'
+            if btc_change_24h <= -1.0:
+                return 'bear'
+            return 'ranging'
+        except Exception:
+            return 'ranging'
+
+    # ------------------------------------------------------------------
     def _fetch_base(self, coin: CoinConfig) -> Optional[Dict]:
         try:
             ohlcv = self.market.fetch_ohlcv(
@@ -1066,7 +1116,8 @@ class SignalManager:
                     logger.error(f"Fetch error on {coin.symbol}: {e}")
         return results
 
-    def _finalize_signal(self, data, market_avg_rsi, btc_change_24h, weights=None):
+    def _finalize_signal(self, data, market_avg_rsi, btc_change_24h,
+                         weights=None, market_regime: str = "ranging"):
         coin = data['coin']
         closes = data['closes']
         highs = data['highs']
@@ -1124,8 +1175,80 @@ class SignalManager:
             risk_reward_ratio=risk['risk_reward_ratio'],
             risk_amount_usd=risk['risk_amount_usd'],
             suggested_position_usd=risk['suggested_position_usd'],
+            btc_trend_label=self.btc_trend_label,
+            market_regime=market_regime,
         )
 
+    # ------------------------------------------------------------------
+    def _detect_state_changes(self, new_signals: Dict[str, CoinSignal],
+                              current_prices: Dict[str, float]):
+        """
+        Detect when a previously actionable signal weakens or flips.
+        Notifies external bot to close the position.
+        """
+        if not _cfg('EXTERNAL_BOT_NOTIFY_STATE_CHANGE', True):
+            return
+
+        try:
+            states = self.tracker.get_all_states()
+        except Exception as e:
+            logger.debug(f"get_all_states failed: {e}")
+            return
+
+        for symbol, new_sig in new_signals.items():
+            prev_state = states.get(symbol)
+            if not prev_state:
+                continue
+
+            prev_type = prev_state.get('last_signal_type') or 'NEUTRAL'
+            prev_pct = float(prev_state.get('confidence') or 0.0)
+            curr_type = new_sig.signal_type.name
+            curr_pct = float(new_sig.total_percentage)
+
+            # Detect actionable change
+            was_actionable = prev_type in ('BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL')
+            is_actionable = curr_type in ('BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL')
+
+            if not was_actionable:
+                continue
+
+            # Case 1: signal flipped to NEUTRAL
+            # Case 2: signal flipped direction
+            # Case 3: signal weakened beyond threshold
+            reason = None
+            if curr_type == 'NEUTRAL':
+                reason = "signal_now_neutral"
+            elif prev_type in ('BUY', 'STRONG_BUY') and curr_type in ('SELL', 'STRONG_SELL'):
+                reason = "signal_flipped_to_sell"
+            elif prev_type in ('SELL', 'STRONG_SELL') and curr_type in ('BUY', 'STRONG_BUY'):
+                reason = "signal_flipped_to_buy"
+            else:
+                # Check magnitude weakening
+                if abs(prev_pct) > 0 and abs(curr_pct) < abs(prev_pct):
+                    drop = abs(prev_pct) - abs(curr_pct)
+                    threshold = _cfg('STATE_CHANGE_THRESHOLD', 30.0)
+                    if drop >= threshold:
+                        reason = f"signal_weakened_by_{drop:.1f}%"
+
+            if reason:
+                logger.info(
+                    f"State change detected: {symbol} "
+                    f"{prev_type} -> {curr_type} ({reason})"
+                )
+                ok = external_bot.send_state_change(
+                    symbol=symbol,
+                    name=new_sig.name,
+                    previous_type=prev_type,
+                    current_type=curr_type,
+                    previous_percentage=prev_pct,
+                    current_percentage=curr_pct,
+                    current_price=current_prices.get(symbol, new_sig.current_price),
+                    reason=reason,
+                )
+                if ok:
+                    logger.info(f"External bot notified to close {symbol}")
+
+    # ------------------------------------------------------------------
     def update_all(self) -> bool:
         with self.lock:
             coins = get_coins()
@@ -1136,12 +1259,12 @@ class SignalManager:
 
             self.fear_greed_index = self.fgi_fetcher.get()
 
-            # ⚡ Compute weights ONCE per update cycle (1 batch query)
+            # Compute weights once per cycle
             try:
                 weights = SignalProcessor._get_weights(self.tracker)
                 logger.info(f"Weights computed for {len(weights)} indicators")
             except Exception as e:
-                logger.warning(f"Weights computation failed, using defaults: {e}")
+                logger.warning(f"Weights computation failed: {e}")
                 weights = {k: 1.0 for k in BASE_MAX_PER_INDICATOR}
 
             intermediate = self._fetch_all_parallel(coins)
@@ -1160,27 +1283,63 @@ class SignalManager:
                     btc_change_24h = d['price_change_24h']
                     break
 
+            market_regime = self._compute_market_regime(btc_change_24h)
+
             logger.info(
                 f"Market context: avg_rsi={market_avg_rsi:.1f}, "
-                f"btc_change_24h={btc_change_24h:+.2f}%"
+                f"btc_change_24h={btc_change_24h:+.2f}%, regime={market_regime}"
             )
 
             success = 0
             current_prices: Dict[str, float] = {}
+            new_signals: Dict[str, CoinSignal] = {}
+
             for data in intermediate:
                 try:
                     sig = self._finalize_signal(
-                        data, market_avg_rsi, btc_change_24h, weights=weights
+                        data, market_avg_rsi, btc_change_24h,
+                        weights=weights, market_regime=market_regime,
                     )
                     if sig and sig.is_valid:
                         self.signals[data['coin'].symbol] = sig
-                        success += 1
+                        new_signals[data['coin'].symbol] = sig
                         current_prices[data['coin'].symbol] = sig.current_price
-                        self.tracker.record(sig)
+                        success += 1
+
+                        # Record signal & get its DB id
+                        signal_id = self.tracker.record(sig)
+
+                        # Notify NTFY
                         self.notification_manager.create_notification(sig)
+
+                        # Send to external bot if actionable
+                        if sig.signal_type.name in (
+                            'BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL'
+                        ):
+                            external_bot.send_entry(
+                                sig,
+                                confidence=abs(sig.total_percentage),
+                                signal_id=signal_id,
+                            )
+
+                        # Update state
+                        self.tracker.update_state(
+                            symbol=sig.symbol,
+                            signal_type=sig.signal_type.name,
+                            signal_id=signal_id,
+                            price=sig.current_price,
+                            confidence=sig.total_percentage,
+                        )
                 except Exception as e:
                     logger.error(f"Pass 2 error on {data['coin'].symbol}: {e}")
 
+            # Detect state changes for external bot (close positions)
+            try:
+                self._detect_state_changes(new_signals, current_prices)
+            except Exception as e:
+                logger.error(f"State change detection error: {e}")
+
+            # Evaluate pending signals
             try:
                 self.tracker.evaluate_pending(current_prices)
             except Exception as e:
@@ -1251,6 +1410,7 @@ class SignalManager:
             'take_profit': s.take_profit, 'risk_reward_ratio': s.risk_reward_ratio,
             'risk_amount_usd': s.risk_amount_usd,
             'suggested_position_usd': s.suggested_position_usd,
+            'market_regime': s.market_regime,
             'is_valid': True,
         }
 
@@ -1269,6 +1429,7 @@ class SignalManager:
             'mtf_score': 0.0, 'mtf_details': {}, 'atr_value': 0.0,
             'stop_loss': 0.0, 'take_profit': 0.0, 'risk_reward_ratio': 0.0,
             'risk_amount_usd': 0.0, 'suggested_position_usd': 0.0,
+            'market_regime': 'unknown',
             'is_valid': False,
         }
 
@@ -1282,8 +1443,7 @@ class SignalManager:
         except Exception:
             return "0"
 
-    @staticmethod
-    def _format_volume(v: float) -> str:
+    @staticmethod    def _format_volume(v: float) -> str:
         try:
             if v >= 1_000_000_000: return f"{v/1_000_000_000:.2f}B"
             if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
@@ -1346,6 +1506,8 @@ class SignalManager:
                 'dynamic_weights': _cfg('USE_DYNAMIC_WEIGHTS', True),
                 'update_interval': config.get('UPDATE_INTERVAL'),
                 'exchange_priority': config.get('EXCHANGE_PRIORITY'),
+                'allow_sells_in_bull': _cfg('ALLOW_SELLS_IN_BULL_MARKET', True),
+                'external_bot_enabled': _cfg('EXTERNAL_BOT_ENABLED', False),
             }
         }
 
@@ -1361,7 +1523,7 @@ class UpdateScheduler:
         self._thread: Optional[threading.Thread] = None
         self._last_run: Optional[datetime] = None
         self._initial_delay = max(0, INITIAL_UPDATE_DELAY)
-        self._run_lock = Lock()  # prevent overlapping update_all calls
+        self._run_lock = Lock()
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -1374,9 +1536,8 @@ class UpdateScheduler:
         )
 
     def _run_once(self):
-        # Skip if another run is in progress
         if not self._run_lock.acquire(blocking=False):
-            logger.debug("update_all already running — skipping this tick")
+            logger.debug("update_all already running — skipping tick")
             return
         try:
             self.manager.update_all()
@@ -1409,16 +1570,14 @@ class UpdateScheduler:
             self._thread.join(timeout=5)
 
     def run_in_background(self):
-        """Trigger one update in a separate thread (non-blocking)."""
         threading.Thread(
             target=self._run_once,
-            daemon=True,
-            name="ManualUpdate"
+            daemon=True, name="ManualUpdate"
         ).start()
 
 
 # ======================================================================
-# Initialize SignalManager
+# Initialize
 # ======================================================================
 try:
     signal_manager = SignalManager()
@@ -1484,15 +1643,12 @@ def api_signals():
 
 @app.route('/api/update', methods=['POST'])
 def manual_update():
-    """Trigger update in background. Returns immediately (202 Accepted)."""
     if signal_manager is None or scheduler is None:
-        return jsonify({'status': 'error', 'message': 'not initialized'}), 503
-
+        return jsonify({'status': 'error'}), 503
     scheduler.run_in_background()
-
     return jsonify({
         'status': 'accepted',
-        'message': 'Update started in background. Check /api/health in ~30s.',
+        'message': 'Update started in background.',
         'timestamp': datetime.now().isoformat(),
     }), 202
 
@@ -1502,9 +1658,9 @@ def health():
     if signal_manager is None:
         return jsonify({
             'status': 'error',
-            'message': 'SignalManager failed to initialize — see logs',
+            'message': 'SignalManager failed to initialize',
             'uptime': time.time() - start_time,
-            'version': '8.3.0',
+            'version': '8.4.0',
         }), 503
 
     last = signal_manager.last_update
@@ -1523,9 +1679,9 @@ def health():
         'btc_bullish': signal_manager.btc_bullish,
         'btc_trend': signal_manager.btc_trend_label,
         'notifications': len(signal_manager.notification_manager.history),
-        'version': '8.3.0',
-        'indicators_count': 10,
+        'version': '8.4.0',
         'tracker': signal_manager.tracker.health_check(),
+        'external_bot_enabled': _cfg('EXTERNAL_BOT_ENABLED', False),
         'max_total_score': MAX_TOTAL_SCORE,
     })
 
@@ -1547,7 +1703,7 @@ def clear_notifications():
     if signal_manager is None:
         return jsonify({'status': 'error'}), 503
     signal_manager.notification_manager.clear_history()
-    return jsonify({'status': 'success', 'message': 'History cleared'})
+    return jsonify({'status': 'success'})
 
 
 @app.route('/api/exchange_status')
@@ -1574,6 +1730,16 @@ def api_signal_stats():
     })
 
 
+@app.route('/api/signal_states')
+def api_signal_states():
+    if signal_manager is None:
+        return jsonify({'status': 'error'}), 503
+    return jsonify({
+        'status': 'success',
+        'states': signal_manager.tracker.get_all_states(),
+    })
+
+
 @app.route('/api/config/full')
 def api_config_full():
     return jsonify({
@@ -1596,6 +1762,11 @@ def api_config_update():
             signal_manager.notification_manager.clear_history()
         if scheduler is not None:
             scheduler.wake()
+        # Reload external bot config
+        try:
+            external_bot.reload_config()
+        except Exception:
+            pass
         return jsonify({
             'status': 'success' if not result['errors'] else 'warning',
             'values': result['values'],
@@ -1613,6 +1784,10 @@ def api_config_reset():
         signal_manager.notification_manager.clear_history()
     if scheduler is not None:
         scheduler.wake()
+    try:
+        external_bot.reload_config()
+    except Exception:
+        pass
     return jsonify({'status': 'success', 'values': values})
 
 
@@ -1625,35 +1800,68 @@ def test_ntfy():
     return jsonify({'success': ok})
 
 
+@app.route('/api/test_external_bot')
+def test_external_bot():
+    """Send a test event to the external bot."""
+    if not _cfg('EXTERNAL_BOT_ENABLED', False):
+        return jsonify({'status': 'error', 'message': 'External bot disabled'}), 400
+    if signal_manager is None:
+        return jsonify({'status': 'error'}), 503
+
+    test_signal = type('S', (), {})()  # dummy object
+    payload = {
+        'symbol': 'TEST/USDT',
+        'name': 'Test',
+        'signal_type': 'BUY',
+        'direction': 'long',
+        'entry_price': 100.0,
+        'score': 3.5,
+        'percentage': 44.8,
+        'confidence': 44.8,
+        'signal_id': None,
+        'stop_loss': 98.0,
+        'take_profit': 104.0,
+        'risk_reward_ratio': 2.0,
+        'suggested_position_usd': 50.0,
+        'risk_amount_usd': 10.0,
+        'btc_bullish': True,
+        'htf_trend': 'bullish',
+        'fear_greed': 50,
+        'atr_value': 1.5,
+        'mtf_details': {'15m': 'bullish'},
+        'price_change_24h': 1.2,
+    }
+    ok = external_bot._post('entry', payload)
+    return jsonify({'success': ok})
+
+
 # ======================================================================
-# Startup notification (delayed)
+# Startup notification
 # ======================================================================
 def send_startup_notification():
     try:
         if signal_manager is None:
-            logger.warning("Cannot send startup notification: signal_manager is None")
             return
         mode = config.get('USE_BTC_FILTER')
         htf = "ON" if config.get('USE_HTF_CONFIRMATION') else "OFF"
         mtf = "ON" if _cfg('USE_MTF_CONFIRMATION', False) else "OFF"
         dw = "ON" if _cfg('USE_DYNAMIC_WEIGHTS', True) else "OFF"
+        ext_bot = "ON" if _cfg('EXTERNAL_BOT_ENABLED', False) else "OFF"
         backend_name = "PostgreSQL (Supabase)" if USE_POSTGRES else "SQLite (local)"
+        sell_bull = "ON" if _cfg('ALLOW_SELLS_IN_BULL_MARKET', True) else "OFF"
 
         coins = get_coins()
         keys = get_exchange_keys()
         msg = (
-            f"Crypto Discriminating Analyzer Started (v8.3)\n"
+            f"Crypto Discriminating Analyzer Started (v8.4)\n"
             f"Tracking {len(coins)} coins\n"
-            f"Indicators: 10 (4 base + 6 relative)\n"
-            f"Max score: {MAX_TOTAL_SCORE}\n"
-            f"Timeframe: {config.get('TIMEFRAME')} | HTF: {config.get('HTF_TIMEFRAME')} | "
-            f"HTF2: {_cfg('HTF2_TIMEFRAME', '1d')}\n"
-            f"BTC filter mode: {mode}\n"
-            f"HTF confirmation: {htf} | MTF: {mtf} | Dynamic weights: {dw}\n"
-            f"Exchange priority: {config.get('EXCHANGE_PRIORITY')}\n"
-            f"API keys: {list(keys.keys()) or 'none'}\n"
+            f"Timeframe: {config.get('TIMEFRAME')} | HTF: {config.get('HTF_TIMEFRAME')}\n"
+            f"BTC filter: {mode}\n"
+            f"HTF: {htf} | MTF: {mtf} | Dynamic weights: {dw}\n"
+            f"Sells in bull market: {sell_bull}\n"
+            f"External bot: {ext_bot}\n"
             f"Update interval: {config.get('UPDATE_INTERVAL')}s\n"
-            f"Signal tracking: enabled ({backend_name})"
+            f"Signal tracking: {backend_name}"
         )
         signal_manager.notification_manager.send_ntfy(msg, "System Started", "3", "rocket")
     except Exception as e:
@@ -1689,17 +1897,15 @@ for _sig in (_signal_sys.SIGTERM, _signal_sys.SIGINT):
 
 
 # ======================================================================
-# Entry point (local run only)
+# Entry point
 # ======================================================================
 if __name__ == '__main__':
     logger.info("=" * 60)
-    logger.info("Crypto Discriminating Analyzer v8.3.0 (local run)")
+    logger.info("Crypto Discriminating Analyzer v8.4.0 (local run)")
     logger.info(f"Backend: {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
     logger.info(f"Coins: {[c.symbol for c in get_coins()]}")
     logger.info(f"Max total score: {MAX_TOTAL_SCORE}")
-    logger.info(f"Initial update delay: {INITIAL_UPDATE_DELAY}s")
-    logger.info(f"Startup notify delay: {STARTUP_NOTIFY_DELAY}s")
-    logger.info(f"Fetch workers: {FETCH_MAX_WORKERS}")
+    logger.info(f"External bot: {'ON' if _cfg('EXTERNAL_BOT_ENABLED', False) else 'OFF'}")
     logger.info(f"NTFY: {NTFY_URL}")
     logger.info(f"Port: {PORT}")
     logger.info("=" * 60)
