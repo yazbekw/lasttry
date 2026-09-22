@@ -24,27 +24,73 @@ class ExternalBotClient:
 
     Events:
       - "entry": actionable signal (BUY/SELL/STRONG)
-      - "state_change": signal no longer holds (or flipped) → close position
+      - "state_change": signal no longer holds → close position
       - "heartbeat": periodic status update
     """
 
     def __init__(self):
+        # Initialize with safe defaults
+        self.enabled = False
+        self.url = ''
+        self.secret = ''
+        self.notify_state_change = False
+        self.state_change_threshold = 30.0
+        # Try to load config immediately
         self._load_config()
 
     def _load_config(self):
+        """
+        Load configuration from config_manager.
+        Logs verbosely so we can debug why values come through empty.
+        """
         try:
             from config_manager import config
-            self.enabled = bool(config.get('EXTERNAL_BOT_ENABLED'))
-            self.url = (config.get('EXTERNAL_BOT_URL') or '').strip()
-            self.secret = (config.get('EXTERNAL_BOT_SECRET') or '').strip()
-            self.notify_state_change = bool(
-                config.get('EXTERNAL_BOT_NOTIFY_STATE_CHANGE', True)
+
+            # Read raw values
+            raw_enabled = config.get('EXTERNAL_BOT_ENABLED')
+            raw_url = config.get('EXTERNAL_BOT_URL')
+            raw_secret = config.get('EXTERNAL_BOT_SECRET')
+            raw_notify = config.get('EXTERNAL_BOT_NOTIFY_STATE_CHANGE')
+            raw_threshold = config.get('STATE_CHANGE_THRESHOLD')
+
+            logger.info(
+                f"ExternalBot._load_config raw values: "
+                f"enabled={raw_enabled!r} url={raw_url!r} "
+                f"secret_len={len(raw_secret) if raw_secret else 0} "
+                f"notify={raw_notify!r} threshold={raw_threshold!r}"
             )
-            self.state_change_threshold = float(
-                config.get('STATE_CHANGE_THRESHOLD', 30.0)
+
+            # Coerce enabled: handle bool, str "true", int 1
+            if isinstance(raw_enabled, bool):
+                self.enabled = raw_enabled
+            elif isinstance(raw_enabled, str):
+                self.enabled = raw_enabled.strip().lower() in ('true', '1', 'yes', 'on')
+            else:
+                self.enabled = bool(raw_enabled)
+
+            self.url = (raw_url or '').strip()
+            self.secret = (raw_secret or '').strip()
+
+            if isinstance(raw_notify, bool):
+                self.notify_state_change = raw_notify
+            else:
+                self.notify_state_change = str(raw_notify).lower() in ('true', '1', 'yes', 'on')
+
+            try:
+                self.state_change_threshold = float(raw_threshold or 30.0)
+            except (ValueError, TypeError):
+                self.state_change_threshold = 30.0
+
+            logger.info(
+                f"ExternalBot configured: enabled={self.enabled}, "
+                f"url_set={bool(self.url)}, secret_set={bool(self.secret)}, "
+                f"notify={self.notify_state_change}"
             )
         except Exception as e:
-            logger.warning(f"ExternalBot config load failed: {e}")
+            import traceback
+            logger.error(f"ExternalBot config load failed: {e}")
+            logger.error(traceback.format_exc())
+            # Keep safe defaults
             self.enabled = False
             self.url = ''
             self.secret = ''
@@ -68,6 +114,10 @@ class ExternalBotClient:
     def _post(self, event_type: str, payload: Dict[str, Any],
               retries: int = 3) -> bool:
         if not self.enabled or not self.url:
+            logger.warning(
+                f"ExternalBot._post({event_type}) skipped: "
+                f"enabled={self.enabled}, url={self.url!r}"
+            )
             return False
 
         payload = dict(payload)
@@ -101,7 +151,7 @@ class ExternalBotClient:
                     return True
                 logger.warning(
                     f"ExternalBot {event_type} attempt {attempt}/{retries} "
-                    f"status={resp.status_code}"
+                    f"status={resp.status_code} body={resp.text[:200]}"
                 )
             except Exception as e:
                 logger.warning(
@@ -132,13 +182,11 @@ class ExternalBotClient:
                 'percentage': float(signal.total_percentage),
                 'confidence': float(confidence),
                 'signal_id': signal_id,
-                # Risk management
                 'stop_loss': float(signal.stop_loss or 0.0),
                 'take_profit': float(signal.take_profit or 0.0),
                 'risk_reward_ratio': float(signal.risk_reward_ratio or 0.0),
                 'suggested_position_usd': float(signal.suggested_position_usd or 0.0),
                 'risk_amount_usd': float(signal.risk_amount_usd or 0.0),
-                # Context
                 'btc_bullish': bool(signal.btc_bullish),
                 'htf_trend': signal.htf_trend,
                 'fear_greed': int(signal.fear_greed_value or 0),
@@ -157,10 +205,7 @@ class ExternalBotClient:
                           current_percentage: float,
                           current_price: float,
                           reason: str = "signal_weakened") -> bool:
-        """
-        Notify the external bot that a previous signal no longer holds.
-        The external bot should CLOSE the position.
-        """
+        """Notify external bot that a signal no longer holds."""
         if not self.enabled or not self.notify_state_change:
             return False
 
