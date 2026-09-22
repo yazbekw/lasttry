@@ -1443,7 +1443,8 @@ class SignalManager:
         except Exception:
             return "0"
 
-    @staticmethod    def _format_volume(v: float) -> str:
+    @staticmethod    
+    def _format_volume(v: float) -> str:
         try:
             if v >= 1_000_000_000: return f"{v/1_000_000_000:.2f}B"
             if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
