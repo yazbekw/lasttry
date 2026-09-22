@@ -19,6 +19,65 @@ from typing import Dict, List
 # ======================================================================
 SETTINGS_METADATA: Dict[str, Dict] = {
 
+        # ------------------------------------------------------------------
+    # Sell behavior
+    # ------------------------------------------------------------------
+    'ALLOW_SELLS_IN_BULL_MARKET': {
+        'type': 'bool',
+        'label': 'Allow Sell Signals in Bull Market',
+        'description': 'Boost negative scores slightly when BTC is bullish (correction opportunities).',
+        'default': True,
+    },
+    'SELL_BULL_BOOST': {
+        'type': 'float',
+        'label': 'Sell Boost in Bull Market',
+        'description': 'Multiplier applied to negative scores when BTC is bullish (1.10 = +10%).',
+        'min': 1.0, 'max': 1.5, 'step': 0.05,
+        'default': 1.10,
+    },
+    'SELL_THRESHOLD_BULL': {
+        'type': 'float',
+        'label': 'Sell Threshold (Bull Market)',
+        'description': 'Lower (easier) threshold for SELL when BTC is bullish.',
+        'min': -7.0, 'max': 0.0, 'step': 0.1,
+        'default': -1.8,
+    },
+
+    # ------------------------------------------------------------------
+    # External bot webhook
+    # ------------------------------------------------------------------
+    'EXTERNAL_BOT_ENABLED': {
+        'type': 'bool',
+        'label': 'Enable External Bot Webhook',
+        'description': 'Send entry signals to an external bot via HTTP POST.',
+        'default': False,
+    },
+    'EXTERNAL_BOT_URL': {
+        'type': 'str',
+        'label': 'External Bot Webhook URL',
+        'description': 'Full URL to POST entry signals to (e.g. https://other-bot.com/webhook).',
+        'default': '',
+    },
+    'EXTERNAL_BOT_SECRET': {
+        'type': 'str',
+        'label': 'External Bot Shared Secret',
+        'description': 'Sent as X-Signature header for authentication.',
+        'default': '',
+    },
+    'EXTERNAL_BOT_NOTIFY_STATE_CHANGE': {
+        'type': 'bool',
+        'label': 'Notify External Bot on State Change',
+        'description': 'Send a "close position" event when a signal no longer holds.',
+        'default': True,
+    },
+    'STATE_CHANGE_THRESHOLD': {
+        'type': 'float',
+        'label': 'State Change Threshold (%)',
+        'description': 'Signal percentage must drop by this much from entry to trigger close.',
+        'min': 5.0, 'max': 90.0, 'step': 5.0,
+        'default': 30.0,
+    },
+
     # ------------------------------------------------------------------
     # Market & timeframes
     # ------------------------------------------------------------------
@@ -289,6 +348,24 @@ SETTINGS_METADATA: Dict[str, Dict] = {
 # Used by the settings page to organize fields into sections
 # ======================================================================
 SETTINGS_GROUPS: List[Dict] = [
+
+    {
+        'name': 'Sell Behavior',
+        'icon': 'arrow-down',
+        'settings': [
+            'ALLOW_SELLS_IN_BULL_MARKET', 'SELL_BULL_BOOST',
+            'SELL_THRESHOLD_BULL',
+        ],
+    },
+    {
+        'name': 'External Bot',
+        'icon': 'share',
+        'settings': [
+            'EXTERNAL_BOT_ENABLED', 'EXTERNAL_BOT_URL',
+            'EXTERNAL_BOT_SECRET', 'EXTERNAL_BOT_NOTIFY_STATE_CHANGE',
+            'STATE_CHANGE_THRESHOLD',
+        ],
+    },
     {
         'name': 'Market',
         'icon': 'chart-line',
