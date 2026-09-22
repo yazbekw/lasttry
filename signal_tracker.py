@@ -1,9 +1,10 @@
 """
 Signal Tracker - Dual backend (PostgreSQL / SQLite)
-- Lazy initialization: no DB connection until first real use
-- Connection pooling for PostgreSQL (reuses connections)
-- Batch queries for indicator stats (1 query instead of N)
-- Compatible with Python 3.10 - 3.12
+- Lazy initialization
+- Connection pooling
+- Batch queries for indicator stats
+- ML-ready: saves extended features for future model training
+- State change tracking for external bot integration
 """
 
 import os
@@ -34,8 +35,7 @@ if DATABASE_URL.startswith(('postgres://', 'postgresql://')):
         logger.info("SignalTracker: PostgreSQL backend selected (Supabase)")
     except BaseException as e:
         logger.error(
-            f"psycopg2 import failed: {type(e).__name__}: {e}. "
-            f"Falling back to SQLite."
+            f"psycopg2 import failed: {type(e).__name__}: {e}. Falling back to SQLite."
         )
         _psycopg2 = None
         USE_POSTGRES = False
@@ -56,7 +56,7 @@ def _sqlite_path() -> str:
 
 
 # ======================================================================
-# PostgreSQL connection pool (lazy)
+# PostgreSQL connection pool
 # ======================================================================
 _pg_pool = None
 _pg_pool_lock = Lock()
@@ -70,10 +70,8 @@ def _get_pg_pool():
                 try:
                     from psycopg2 import pool as pg_pool
                     _pg_pool = pg_pool.SimpleConnectionPool(
-                        minconn=1,
-                        maxconn=5,
-                        dsn=DATABASE_URL,
-                        connect_timeout=10,
+                        minconn=1, maxconn=5,
+                        dsn=DATABASE_URL, connect_timeout=10,
                     )
                     logger.info("PostgreSQL connection pool created (min=1, max=5)")
                 except Exception as e:
@@ -83,7 +81,7 @@ def _get_pg_pool():
 
 
 # ======================================================================
-# Connection wrappers
+# Connection wrapper
 # ======================================================================
 class _PgConnection:
     def __init__(self, conn):
@@ -130,7 +128,6 @@ class _PgConnection:
 
 @contextmanager
 def _get_conn():
-    """Yield a DB connection. Uses pooling for PostgreSQL, direct for SQLite."""
     if USE_POSTGRES and _psycopg2 is not None:
         p = _get_pg_pool()
         if p is not None:
@@ -151,7 +148,6 @@ def _get_conn():
                         pass
                     raise
             except Exception as e:
-                # Pool failure → fallback to direct
                 if conn is None:
                     logger.warning(f"Pool getconn failed, using direct: {e}")
                     raw = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
@@ -171,7 +167,6 @@ def _get_conn():
                     except Exception:
                         pass
         else:
-            # No pool → direct connection
             raw = _psycopg2.connect(DATABASE_URL, connect_timeout=10)
             try:
                 yield _PgConnection(raw)
@@ -213,7 +208,22 @@ def _ddl_signals() -> str:
                 pct_4h DOUBLE PRECISION,
                 pct_24h DOUBLE PRECISION,
                 outcome TEXT,
-                evaluated_at TEXT
+                evaluated_at TEXT,
+                -- ML-ready features
+                fear_greed_value INTEGER,
+                atr_value DOUBLE PRECISION,
+                btc_trend_label TEXT,
+                btc_bullish INTEGER,
+                market_regime TEXT,
+                htf_trend TEXT,
+                mtf_details TEXT,
+                hour_of_day INTEGER,
+                day_of_week INTEGER,
+                timeframe TEXT,
+                account_size DOUBLE PRECISION,
+                risk_reward_ratio DOUBLE PRECISION,
+                stop_loss DOUBLE PRECISION,
+                take_profit DOUBLE PRECISION
             )
         """
     return """
@@ -230,7 +240,21 @@ def _ddl_signals() -> str:
             price_1h REAL, price_4h REAL, price_24h REAL,
             pct_1h REAL, pct_4h REAL, pct_24h REAL,
             outcome TEXT,
-            evaluated_at TEXT
+            evaluated_at TEXT,
+            fear_greed_value INTEGER,
+            atr_value REAL,
+            btc_trend_label TEXT,
+            btc_bullish INTEGER,
+            market_regime TEXT,
+            htf_trend TEXT,
+            mtf_details TEXT,
+            hour_of_day INTEGER,
+            day_of_week INTEGER,
+            timeframe TEXT,
+            account_size REAL,
+            risk_reward_ratio REAL,
+            stop_loss REAL,
+            take_profit REAL
         )
     """
 
@@ -247,10 +271,36 @@ def _ddl_indicator_accuracy() -> str:
     """
 
 
+def _ddl_signal_state() -> str:
+    """Tracks the last signal state per symbol to detect changes."""
+    if USE_POSTGRES:
+        return """
+            CREATE TABLE IF NOT EXISTS signal_state (
+                symbol TEXT PRIMARY KEY,
+                last_signal_type TEXT,
+                last_signal_id INTEGER,
+                last_update TEXT,
+                last_price DOUBLE PRECISION,
+                confidence DOUBLE PRECISION
+            )
+        """
+    return """
+        CREATE TABLE IF NOT EXISTS signal_state (
+            symbol TEXT PRIMARY KEY,
+            last_signal_type TEXT,
+            last_signal_id INTEGER,
+            last_update TEXT,
+            last_price REAL,
+            confidence REAL
+        )
+    """
+
+
 def _indexes() -> List[str]:
     return [
         "CREATE INDEX IF NOT EXISTS idx_signals_sym_created ON signals(symbol, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_signals_evaluated ON signals(evaluated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals(outcome)",
     ]
 
 
@@ -276,6 +326,32 @@ def _upsert_indicator_sql() -> str:
     """
 
 
+def _upsert_signal_state_sql() -> str:
+    if USE_POSTGRES:
+        return """
+            INSERT INTO signal_state
+                (symbol, last_signal_type, last_signal_id, last_update, last_price, confidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol) DO UPDATE SET
+                last_signal_type = EXCLUDED.last_signal_type,
+                last_signal_id = EXCLUDED.last_signal_id,
+                last_update = EXCLUDED.last_update,
+                last_price = EXCLUDED.last_price,
+                confidence = EXCLUDED.confidence
+        """
+    return """
+        INSERT INTO signal_state
+            (symbol, last_signal_type, last_signal_id, last_update, last_price, confidence)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(symbol) DO UPDATE SET
+            last_signal_type = excluded.last_signal_type,
+            last_signal_id = excluded.last_signal_id,
+            last_update = excluded.last_update,
+            last_price = excluded.last_price,
+            confidence = excluded.confidence
+    """
+
+
 # ======================================================================
 # SignalTracker
 # ======================================================================
@@ -288,7 +364,6 @@ class SignalTracker:
         self._initialized = False
         self._init_failed = False
 
-    # ------------------------------------------------------------------
     def _ensure_init(self) -> bool:
         if self._initialized:
             return True
@@ -314,16 +389,57 @@ class SignalTracker:
         with _get_conn() as conn:
             conn.executescript(_ddl_signals())
             conn.executescript(_ddl_indicator_accuracy())
+            conn.executescript(_ddl_signal_state())
             for idx in _indexes():
                 try:
                     conn.execute(idx)
                 except Exception as e:
                     logger.debug(f"Index skipped: {e}")
+            # Migration: add missing columns if signals table already exists
+            self._migrate_columns(conn)
+
+    def _migrate_columns(self, conn):
+        """Add new columns if they don't exist (safe migration)."""
+        new_cols = [
+            ('fear_greed_value', 'INTEGER'),
+            ('atr_value', 'DOUBLE PRECISION' if USE_POSTGRES else 'REAL'),
+            ('btc_trend_label', 'TEXT'),
+            ('btc_bullish', 'INTEGER'),
+            ('market_regime', 'TEXT'),
+            ('htf_trend', 'TEXT'),
+            ('mtf_details', 'TEXT'),
+            ('hour_of_day', 'INTEGER'),
+            ('day_of_week', 'INTEGER'),
+            ('timeframe', 'TEXT'),
+            ('account_size', 'DOUBLE PRECISION' if USE_POSTGRES else 'REAL'),
+            ('risk_reward_ratio', 'DOUBLE PRECISION' if USE_POSTGRES else 'REAL'),
+            ('stop_loss', 'DOUBLE PRECISION' if USE_POSTGRES else 'REAL'),
+            ('take_profit', 'DOUBLE PRECISION' if USE_POSTGRES else 'REAL'),
+        ]
+        for col_name, col_type in new_cols:
+            try:
+                if USE_POSTGRES:
+                    conn.execute(
+                        f"ALTER TABLE signals ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                    )
+                else:
+                    # SQLite doesn't support IF NOT EXISTS on ALTER
+                    try:
+                        conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+                    except Exception:
+                        pass  # Column already exists
+            except Exception as e:
+                logger.debug(f"Migration skipped for {col_name}: {e}")
 
     # ------------------------------------------------------------------
-    def record(self, signal) -> None:
+    def record(self, signal) -> Optional[int]:
+        """
+        Persist an actionable signal.
+        Returns the row ID if inserted, None otherwise.
+        """
         if not self._ensure_init():
-            return
+            return None
+
         try:
             try:
                 from app2 import SignalType
@@ -333,26 +449,55 @@ class SignalTracker:
                 except Exception:
                     SignalType = None
             if SignalType is not None and signal.signal_type == SignalType.NEUTRAL:
-                return
+                return None
         except Exception:
             pass
 
         try:
             raw_scores = {k: v.raw_score for k, v in signal.indicator_scores.items()}
+            created = signal.last_updated
+            mtf_details_json = json.dumps(getattr(signal, 'mtf_details', {}) or {})
+
             with self._lock, _get_conn() as conn:
-                conn.execute("""
+                cur = conn.execute("""
                     INSERT INTO signals
                         (symbol, signal_type, score, percentage, price, created_at,
-                         raw_scores, mtf_score)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         raw_scores, mtf_score,
+                         fear_greed_value, atr_value, btc_trend_label, btc_bullish,
+                         market_regime, htf_trend, mtf_details,
+                         hour_of_day, day_of_week, timeframe,
+                         account_size, risk_reward_ratio, stop_loss, take_profit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
                 """, (
                     signal.symbol, signal.signal_type.name,
                     signal.total_score, signal.total_percentage,
-                    signal.current_price, signal.last_updated.isoformat(),
-                    json.dumps(raw_scores), getattr(signal, 'mtf_score', 0.0),
+                    signal.current_price, created.isoformat(),
+                    json.dumps(raw_scores),
+                    getattr(signal, 'mtf_score', 0.0),
+                    getattr(signal, 'fear_greed_value', None),
+                    getattr(signal, 'atr_value', None),
+                    getattr(signal, 'btc_trend_label', None) if hasattr(signal, 'btc_trend_label') else None,
+                    1 if getattr(signal, 'btc_bullish', False) else 0,
+                    getattr(signal, 'market_regime', None) if hasattr(signal, 'market_regime') else None,
+                    getattr(signal, 'htf_trend', None),
+                    mtf_details_json,
+                    created.hour,
+                    created.weekday(),
+                    os.environ.get('TIMEFRAME', '15m'),
+                    None,  # account_size
+                    getattr(signal, 'risk_reward_ratio', None),
+                    getattr(signal, 'stop_loss', None),
+                    getattr(signal, 'take_profit', None),
                 ))
+                row = cur.fetchone() if cur else None
+                if row:
+                    r = dict(row) if not isinstance(row, dict) else row
+                    return int(r.get('id')) if r.get('id') is not None else None
+                return None
         except Exception as e:
             logger.error(f"SignalTracker.record error: {e}")
+            return None
 
     # ------------------------------------------------------------------
     def evaluate_pending(self, current_prices: Dict[str, float]) -> int:
@@ -432,7 +577,61 @@ class SignalTracker:
                 logger.debug(f"upsert failed {ind}: {e}")
 
     # ------------------------------------------------------------------
-    # SINGLE indicator stats
+    # Signal state (for detecting changes)
+    # ------------------------------------------------------------------
+    def get_last_state(self, symbol: str) -> Optional[Dict]:
+        """Get the last recorded state for a symbol."""
+        if not self._ensure_init():
+            return None
+        try:
+            with _get_conn() as conn:
+                row = conn.execute(
+                    "SELECT symbol, last_signal_type, last_signal_id, "
+                    "last_update, last_price, confidence "
+                    "FROM signal_state WHERE symbol=?",
+                    (symbol,)
+                ).fetchone()
+                if row:
+                    return dict(row) if not isinstance(row, dict) else row
+        except Exception as e:
+            logger.error(f"get_last_state error: {e}")
+        return None
+
+    def update_state(self, symbol: str, signal_type: str,
+                     signal_id: Optional[int], price: float,
+                     confidence: float = 0.0) -> None:
+        """Upsert signal state for a symbol."""
+        if not self._ensure_init():
+            return
+        try:
+            sql = _upsert_signal_state_sql()
+            with self._lock, _get_conn() as conn:
+                conn.execute(sql, (
+                    symbol, signal_type, signal_id,
+                    datetime.now().isoformat(), price, confidence,
+                ))
+        except Exception as e:
+            logger.error(f"update_state error: {e}")
+
+    def get_all_states(self) -> Dict[str, Dict]:
+        """Return all tracked states."""
+        if not self._ensure_init():
+            return {}
+        try:
+            with _get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT symbol, last_signal_type, last_signal_id, "
+                    "last_update, last_price, confidence FROM signal_state"
+                ).fetchall()
+                out = {}
+                for row in rows:
+                    r = dict(row) if not isinstance(row, dict) else row
+                    out[r['symbol']] = r
+                return out
+        except Exception as e:
+            logger.error(f"get_all_states error: {e}")
+            return {}
+
     # ------------------------------------------------------------------
     def get_indicator_stats(self, indicator: str) -> Dict[str, int]:
         empty = {'wins': 0, 'losses': 0, 'total': 0}
@@ -455,9 +654,6 @@ class SignalTracker:
             logger.error(f"get_indicator_stats error: {e}")
         return empty
 
-    # ------------------------------------------------------------------
-    # ⚡ BATCH indicator stats (1 query instead of N)
-    # ------------------------------------------------------------------
     def get_all_indicator_stats_batch(self) -> Dict[str, Dict[str, int]]:
         """Return stats for ALL indicators in a single query."""
         if not self._ensure_init():
@@ -480,7 +676,6 @@ class SignalTracker:
             logger.error(f"get_all_indicator_stats_batch error: {e}")
             return {}
 
-    # ------------------------------------------------------------------
     def get_all_stats(self) -> List[Dict]:
         if not self._ensure_init():
             return []
@@ -543,7 +738,8 @@ class SignalTracker:
             with _get_conn() as conn:
                 rows = conn.execute("""
                     SELECT symbol, signal_type, score, percentage, price,
-                           created_at, pct_1h, pct_4h, pct_24h, outcome
+                           created_at, pct_1h, pct_4h, pct_24h, outcome,
+                           fear_greed_value, atr_value, btc_trend_label, market_regime
                     FROM signals ORDER BY id DESC LIMIT ?
                 """, (limit,)).fetchall()
                 return [dict(r) if not isinstance(r, dict) else r for r in rows]
